@@ -1,0 +1,12 @@
+# Debug files
+claude-timeline-debug.json
+debug-style.json
+*.log
+
+# Scripts and private data
+DOM分析脚本及数据/
+claude-active-diagnose.js
+
+# OS files
+.DS_Store
+Thumbs.db

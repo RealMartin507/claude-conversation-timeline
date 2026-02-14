@@ -1,0 +1,173 @@
+:root {
+  --claude-timeline-dot: #94a3b8;
+  --claude-timeline-active: #f97316;
+  --claude-timeline-star: #f59e0b;
+  --claude-timeline-bar-bg: rgba(248, 250, 252, 0.55);
+  --claude-timeline-bar-border: rgba(148, 163, 184, 0.35);
+  --claude-timeline-bar-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+  --claude-timeline-tooltip-bg: #ffffff;
+  --claude-timeline-tooltip-text: #1f2937;
+  --claude-timeline-tooltip-border: #e2e8f0;
+  --claude-timeline-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --claude-timeline-dot: #71717a;
+    --claude-timeline-active: #fb923c;
+    --claude-timeline-star: #fbbf24;
+    --claude-timeline-bar-bg: rgba(255, 255, 255, 0.03);
+    --claude-timeline-bar-border: rgba(255, 255, 255, 0.04);
+    --claude-timeline-bar-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+    --claude-timeline-tooltip-bg: #18191b;
+    --claude-timeline-tooltip-text: #e2e8f0;
+    --claude-timeline-tooltip-border: rgba(255, 255, 255, 0.08);
+    --claude-timeline-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+}
+
+html[data-theme*="dark"],
+body[data-theme*="dark"],
+html[data-mode="dark"],
+body[data-mode="dark"],
+html.dark,
+body.dark,
+:root[class*="dark"] {
+  --claude-timeline-dot: #71717a;
+  --claude-timeline-active: #fb923c;
+  --claude-timeline-star: #fbbf24;
+  --claude-timeline-bar-bg: rgba(255, 255, 255, 0.03);
+  --claude-timeline-bar-border: rgba(255, 255, 255, 0.04);
+  --claude-timeline-bar-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  --claude-timeline-tooltip-bg: #18191b;
+  --claude-timeline-tooltip-text: #e2e8f0;
+  --claude-timeline-tooltip-border: rgba(255, 255, 255, 0.08);
+  --claude-timeline-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.claude-timeline-bar {
+  position: fixed;
+  top: 64px;
+  right: 16px;
+  width: 26px;
+  height: calc(100vh - 120px);
+  border-radius: 12px;
+  background: var(--claude-timeline-bar-bg);
+  backdrop-filter: blur(12px) saturate(1.15);
+  -webkit-backdrop-filter: blur(12px) saturate(1.15);
+  border: 1px solid var(--claude-timeline-bar-border);
+  box-shadow: var(--claude-timeline-bar-shadow);
+  z-index: 2147483646;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  overflow: visible;
+  contain: layout paint;
+}
+
+.claude-timeline-track {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.claude-timeline-dot {
+  position: absolute;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+
+.claude-timeline-dot::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: var(--claude-timeline-dot);
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.08);
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+
+.claude-timeline-dot:hover::after {
+  transform: translate(-50%, -50%) scale(1.15);
+}
+
+.claude-timeline-dot:focus-visible::after {
+  box-shadow: 0 0 6px var(--claude-timeline-active);
+}
+
+.claude-timeline-dot.active::after {
+  box-shadow: 0 0 0 3px var(--claude-timeline-active), 0 0 6px var(--claude-timeline-active);
+}
+
+.claude-timeline-dot.starred::after {
+  background: var(--claude-timeline-star);
+}
+
+.claude-timeline-dot.holding::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 20px;
+  height: 20px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--claude-timeline-active) inset;
+  opacity: 0.2;
+  animation: claude-timeline-hold 550ms linear forwards;
+}
+
+@keyframes claude-timeline-hold {
+  from {
+    opacity: 0.2;
+  }
+
+  to {
+    opacity: 0.85;
+  }
+}
+
+.claude-timeline-tooltip {
+  position: fixed;
+  max-width: 280px;
+  padding: 10px 12px;
+  background: var(--claude-timeline-tooltip-bg);
+  color: var(--claude-timeline-tooltip-text);
+  border-radius: 12px;
+  border: 1px solid var(--claude-timeline-tooltip-border);
+  box-shadow: var(--claude-timeline-shadow);
+  font-size: 12px;
+  line-height: 18px;
+  z-index: 2147483647;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.claude-timeline-tooltip.visible {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+  .claude-timeline-dot::after,
+  .claude-timeline-tooltip {
+    transition: none;
+  }
+}

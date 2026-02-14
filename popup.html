@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude 会话时间轴</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div>
+          <div class="title">Claude 会话时间轴</div>
+          <div class="subtitle">一键跳转 · 长按标记 · 自动主题</div>
+        </div>
+        <label class="switch">
+          <input id="globalToggle" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </header>
+
+      <section class="section">
+        <div class="section-title">网站</div>
+        <div class="provider">
+          <div class="provider-left">
+            <div class="provider-dot"></div>
+            <div class="provider-name">Claude</div>
+          </div>
+          <label class="switch">
+            <input id="provider-claude-toggle" type="checkbox" />
+            <span class="slider"></span>
+          </label>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <span>设置即时生效</span>
+      </footer>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>
