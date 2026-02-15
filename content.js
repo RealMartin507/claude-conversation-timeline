@@ -15,7 +15,6 @@
       this.ui = { bar: null, track: null, tooltip: null };
 
       this.mutationObserver = null;
-      this.userMessageObserver = null;
       this.resizeObserver = null;
       this.intersectionObserver = null;
       this.themeObserver = null;
@@ -64,8 +63,20 @@
       const firstMessage = await this.waitForElement(USER_MESSAGE_SELECTOR);
       if (!firstMessage) return false;
       const messages = Array.from(document.querySelectorAll(USER_MESSAGE_SELECTOR));
-      this.conversationContainer = this.findCommonAncestor(messages) || document.body;
       this.scrollContainer = this.pickScrollContainer(messages) || document.scrollingElement || document.documentElement || document.body;
+
+      // 关键修复：如果找到了特定的滚动容器（非body），优先将其作为观察对象
+      // 这避免了在只有一条消息时，findCommonAncestor 错误地锁定到消息的直接父Wrapper，导致后续兄弟消息无法被监听
+      const common = this.findCommonAncestor(messages);
+      if (this.scrollContainer instanceof Element &&
+        this.scrollContainer !== document.body &&
+        this.scrollContainer !== document.documentElement &&
+        this.scrollContainer !== document.scrollingElement) {
+        this.conversationContainer = this.scrollContainer;
+      } else {
+        this.conversationContainer = common || document.body;
+      }
+
       return true;
     }
 
@@ -99,44 +110,37 @@
     }
 
     setupObservers() {
-      // 通用 MutationObserver (用于一般性的DOM变化)
-      this.mutationObserver = new MutationObserver(() => {
-        this.debouncedRecalculate();
-      });
-      this.mutationObserver.observe(this.conversationContainer, { childList: true, subtree: true });
+      // 统一的 MutationObserver：容器验证 + 智能触发更新
+      // 合并了原来的 mutationObserver 和 userMessageObserver，减少重复监听
+      this.mutationObserver = new MutationObserver((mutations) => {
+        // 每次 Mutation 回调先主动检查容器有效性
+        this.ensureContainersUpToDate();
 
-      // 专门监听用户消息的 Observer (立即响应新消息，无防抖延迟)
-      this.userMessageObserver = new MutationObserver((mutations) => {
-        let foundNewMessage = false;
-
+        // 判断是否有新用户消息被添加
+        let hasNewUserMessage = false;
         for (const mutation of mutations) {
           if (mutation.type === 'childList') {
             for (const node of mutation.addedNodes) {
               if (node.nodeType === Node.ELEMENT_NODE &&
-                (node.matches(USER_MESSAGE_SELECTOR) ||
-                  node.querySelector(USER_MESSAGE_SELECTOR))) {
-                foundNewMessage = true;
+                (node.matches?.(USER_MESSAGE_SELECTOR) ||
+                  node.querySelector?.(USER_MESSAGE_SELECTOR))) {
+                hasNewUserMessage = true;
                 break;
               }
             }
           }
-          if (foundNewMessage) break;
+          if (hasNewUserMessage) break;
         }
 
-        if (foundNewMessage) {
-          // 发现新用户消息：立即更新时间轴
-          requestAnimationFrame(() => {
-            this.recalculateAndRenderMarkers();
-          });
+        if (hasNewUserMessage) {
+          // 新用户消息：立即更新时间轴（无防抖延迟）
+          requestAnimationFrame(() => this.recalculateAndRenderMarkers());
+        } else {
+          // 其他 DOM 变化（如 Claude 流式回复）：防抖更新
+          this.debouncedRecalculate();
         }
       });
-
-      if (this.conversationContainer && document.body.contains(this.conversationContainer)) {
-        this.userMessageObserver.observe(this.conversationContainer, {
-          childList: true,
-          subtree: true
-        });
-      }
+      this.mutationObserver.observe(this.conversationContainer, { childList: true, subtree: true });
 
       this.resizeObserver = new ResizeObserver(() => {
         this.recalculateAndRenderMarkers();
@@ -170,53 +174,43 @@
       this.updateIntersectionObserverTargets();
     }
 
+    // 主动检查容器有效性（每次 Mutation 回调时调用）
+    ensureContainersUpToDate() {
+      if (this.conversationContainer && document.body.contains(this.conversationContainer)) return;
+
+      // 容器已失效（被 Claude 替换），需要重新查找
+      console.log('[Timeline] Container lost, rebinding observers...');
+      // 注意：此处必须用全局查询，因为旧容器已脱离 DOM
+      const messages = Array.from(document.querySelectorAll(USER_MESSAGE_SELECTOR));
+      if (messages.length === 0) return;
+
+      const common = this.findCommonAncestor(messages);
+      let newContainer = common || document.body;
+
+      // 优先使用 ScrollContainer（确保监听范围覆盖所有消息）
+      if (this.scrollContainer instanceof Element &&
+        this.scrollContainer !== document.body &&
+        this.scrollContainer !== document.documentElement &&
+        this.scrollContainer !== document.scrollingElement) {
+        if (!common || this.scrollContainer.contains(common)) {
+          newContainer = this.scrollContainer;
+        }
+      }
+
+      if (newContainer !== this.conversationContainer) {
+        this.conversationContainer = newContainer;
+        this.rebindObservers();
+      }
+    }
+
+    // 仅重新绑定 MutationObserver 到新容器（回调逻辑保持不变，无需重建 Observer）
     rebindObservers() {
-      // 重新绑定 MutationObserver
       if (this.mutationObserver) {
         try { this.mutationObserver.disconnect(); } catch { }
       }
-      this.mutationObserver = new MutationObserver(() => {
-        this.debouncedRecalculate();
-      });
       if (this.conversationContainer) {
         this.mutationObserver.observe(this.conversationContainer, { childList: true, subtree: true });
       }
-
-      // 重新绑定 userMessageObserver
-      if (this.userMessageObserver) {
-        try { this.userMessageObserver.disconnect(); } catch { }
-      }
-      this.userMessageObserver = new MutationObserver((mutations) => {
-        let foundNewMessage = false;
-
-        for (const mutation of mutations) {
-          if (mutation.type === 'childList') {
-            for (const node of mutation.addedNodes) {
-              if (node.nodeType === Node.ELEMENT_NODE &&
-                (node.matches(USER_MESSAGE_SELECTOR) ||
-                  node.querySelector(USER_MESSAGE_SELECTOR))) {
-                foundNewMessage = true;
-                break;
-              }
-            }
-          }
-          if (foundNewMessage) break;
-        }
-
-        if (foundNewMessage) {
-          requestAnimationFrame(() => {
-            this.recalculateAndRenderMarkers();
-          });
-        }
-      });
-
-      if (this.conversationContainer && document.body.contains(this.conversationContainer)) {
-        this.userMessageObserver.observe(this.conversationContainer, {
-          childList: true,
-          subtree: true
-        });
-      }
-
       console.log('[Timeline] Observers rebound to new container');
     }
 
@@ -322,25 +316,16 @@
     }
 
     recalculateAndRenderMarkers() {
-      if (!this.ui.track) return;
+      if (!this.ui.track || !this.conversationContainer) return;
 
-      const elements = Array.from(document.querySelectorAll(USER_MESSAGE_SELECTOR));
-      if (elements.length === 0) return;
-
-      // 关键修复：检查 conversationContainer 是否仍在 DOM 中
-      const containerInDOM = this.conversationContainer && document.body.contains(this.conversationContainer);
-
-      if (!containerInDOM) {
-        // 容器已失效（被 Claude 替换），需要重新查找并重新绑定观察器
-        console.log('[Timeline] Container lost, rebinding observers...');
-        const newContainer = this.findCommonAncestor(elements) || document.body;
-
-        if (newContainer !== this.conversationContainer) {
-          this.conversationContainer = newContainer;
-          // 重新绑定观察器
-          this.rebindObservers();
-        }
+      // 安全检查：确保容器仍有效（主要验证已在 Mutation 回调的 ensureContainersUpToDate 中完成）
+      if (!document.body.contains(this.conversationContainer)) {
+        this.ensureContainersUpToDate();
       }
+
+      // 限定范围查询：仅在 conversationContainer 内搜索，避免全局 DOM 扫描
+      const elements = Array.from(this.conversationContainer.querySelectorAll(USER_MESSAGE_SELECTOR));
+      if (elements.length === 0) return;
 
       const positions = elements.map(el => this.getElementTop(el));
       const firstOffset = positions[0];
@@ -735,7 +720,6 @@
 
     destroy() {
       try { this.mutationObserver?.disconnect(); } catch { }
-      try { this.userMessageObserver?.disconnect(); } catch { }
       try { this.resizeObserver?.disconnect(); } catch { }
       try { this.intersectionObserver?.disconnect(); } catch { }
       try { this.themeObserver?.disconnect(); } catch { }
