@@ -15,6 +15,7 @@
       this.ui = { bar: null, track: null, tooltip: null };
 
       this.mutationObserver = null;
+      this.userMessageObserver = null;
       this.resizeObserver = null;
       this.intersectionObserver = null;
       this.themeObserver = null;
@@ -98,10 +99,44 @@
     }
 
     setupObservers() {
+      // 通用 MutationObserver (用于一般性的DOM变化)
       this.mutationObserver = new MutationObserver(() => {
         this.debouncedRecalculate();
       });
       this.mutationObserver.observe(this.conversationContainer, { childList: true, subtree: true });
+
+      // 专门监听用户消息的 Observer (立即响应新消息，无防抖延迟)
+      this.userMessageObserver = new MutationObserver((mutations) => {
+        let foundNewMessage = false;
+
+        for (const mutation of mutations) {
+          if (mutation.type === 'childList') {
+            for (const node of mutation.addedNodes) {
+              if (node.nodeType === Node.ELEMENT_NODE &&
+                (node.matches(USER_MESSAGE_SELECTOR) ||
+                  node.querySelector(USER_MESSAGE_SELECTOR))) {
+                foundNewMessage = true;
+                break;
+              }
+            }
+          }
+          if (foundNewMessage) break;
+        }
+
+        if (foundNewMessage) {
+          // 发现新用户消息：立即更新时间轴
+          requestAnimationFrame(() => {
+            this.recalculateAndRenderMarkers();
+          });
+        }
+      });
+
+      if (this.conversationContainer && document.body.contains(this.conversationContainer)) {
+        this.userMessageObserver.observe(this.conversationContainer, {
+          childList: true,
+          subtree: true
+        });
+      }
 
       this.resizeObserver = new ResizeObserver(() => {
         this.recalculateAndRenderMarkers();
@@ -134,6 +169,57 @@
 
       this.updateIntersectionObserverTargets();
     }
+
+    rebindObservers() {
+      // 重新绑定 MutationObserver
+      if (this.mutationObserver) {
+        try { this.mutationObserver.disconnect(); } catch { }
+      }
+      this.mutationObserver = new MutationObserver(() => {
+        this.debouncedRecalculate();
+      });
+      if (this.conversationContainer) {
+        this.mutationObserver.observe(this.conversationContainer, { childList: true, subtree: true });
+      }
+
+      // 重新绑定 userMessageObserver
+      if (this.userMessageObserver) {
+        try { this.userMessageObserver.disconnect(); } catch { }
+      }
+      this.userMessageObserver = new MutationObserver((mutations) => {
+        let foundNewMessage = false;
+
+        for (const mutation of mutations) {
+          if (mutation.type === 'childList') {
+            for (const node of mutation.addedNodes) {
+              if (node.nodeType === Node.ELEMENT_NODE &&
+                (node.matches(USER_MESSAGE_SELECTOR) ||
+                  node.querySelector(USER_MESSAGE_SELECTOR))) {
+                foundNewMessage = true;
+                break;
+              }
+            }
+          }
+          if (foundNewMessage) break;
+        }
+
+        if (foundNewMessage) {
+          requestAnimationFrame(() => {
+            this.recalculateAndRenderMarkers();
+          });
+        }
+      });
+
+      if (this.conversationContainer && document.body.contains(this.conversationContainer)) {
+        this.userMessageObserver.observe(this.conversationContainer, {
+          childList: true,
+          subtree: true
+        });
+      }
+
+      console.log('[Timeline] Observers rebound to new container');
+    }
+
 
     setupEventListeners() {
       this.onScroll = () => this.scheduleActiveSync();
@@ -236,9 +322,25 @@
     }
 
     recalculateAndRenderMarkers() {
-      if (!this.conversationContainer || !this.ui.track) return;
+      if (!this.ui.track) return;
+
       const elements = Array.from(document.querySelectorAll(USER_MESSAGE_SELECTOR));
       if (elements.length === 0) return;
+
+      // 关键修复：检查 conversationContainer 是否仍在 DOM 中
+      const containerInDOM = this.conversationContainer && document.body.contains(this.conversationContainer);
+
+      if (!containerInDOM) {
+        // 容器已失效（被 Claude 替换），需要重新查找并重新绑定观察器
+        console.log('[Timeline] Container lost, rebinding observers...');
+        const newContainer = this.findCommonAncestor(elements) || document.body;
+
+        if (newContainer !== this.conversationContainer) {
+          this.conversationContainer = newContainer;
+          // 重新绑定观察器
+          this.rebindObservers();
+        }
+      }
 
       const positions = elements.map(el => this.getElementTop(el));
       const firstOffset = positions[0];
@@ -633,6 +735,7 @@
 
     destroy() {
       try { this.mutationObserver?.disconnect(); } catch { }
+      try { this.userMessageObserver?.disconnect(); } catch { }
       try { this.resizeObserver?.disconnect(); } catch { }
       try { this.intersectionObserver?.disconnect(); } catch { }
       try { this.themeObserver?.disconnect(); } catch { }

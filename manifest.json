@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Claude Conversation Timeline",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "为 Claude.ai 对话页面添加时间轴导航功能，支持一键跳转、标记重点、自动主题适配。",
     "action": {
         "default_popup": "popup.html",
