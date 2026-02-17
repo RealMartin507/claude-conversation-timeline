@@ -18,9 +18,5 @@ Thumbs.db
 # Kiro AI assistant (personal workspace)
 .kiro/
 
-# Development notes (personal)
-DEV_FIX_LOG.md
-OPTIMIZATION_TODO.md
-
 # Agent workspace
 .agent/
