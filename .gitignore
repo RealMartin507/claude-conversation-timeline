@@ -10,3 +10,17 @@ claude-active-diagnose.js
 # OS files
 .DS_Store
 Thumbs.db
+
+# Editor settings (personal configurations)
+.vscode/
+.idea/
+
+# Kiro AI assistant (personal workspace)
+.kiro/
+
+# Development notes (personal)
+DEV_FIX_LOG.md
+OPTIMIZATION_TODO.md
+
+# Agent workspace
+.agent/
