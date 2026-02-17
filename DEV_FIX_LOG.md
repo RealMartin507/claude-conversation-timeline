@@ -1,60 +1,92 @@
-# 🔧 时间轴开发修复记录 (v1.2.0 / 2026-02-15)
+# 时间轴架构基线 (v1.4.0 / 2026-02-17)
 
-本项目灵感源自 [chatgpt-conversation-timeline](https://github.com/Reborn14/chatgpt-conversation-timeline)，为 Claude.ai 实现时间轴功能。  
-Claude 的 DOM 结构比 ChatGPT 更复杂（深度嵌套、无稳定消息 ID），因此有独特的适配需求。
+> **读者**：下一个 AI agent  
+> **范围**：`content.js`（TimelineManager 类）+ `styles.css`
 
 ---
 
-## ⚠️ 核心设计决策（请勿随意修改）
+## 🚫 不可打破的约束
 
-### 1. 容器定位：强制使用 ScrollContainer
+| # | 约束 | 原因 |
+|---|------|------|
+| 1 | `conversationContainer` 必须优先 `scrollContainer` | Claude 单消息时 `findCommonAncestor` 锁定范围过窄，后续消息不在监听范围 |
+| 2 | `MutationObserver` 回调首行必须 `ensureContainersUpToDate()` | Claude 流式回复结束后整体替换 DOM 容器，需主动检测失效并重绑 |
+| 3 | 保持**单一** MutationObserver | 新消息 → RAF 立即渲染；其他变化 → debounce 250ms |
+| 4 | 禁止时间轴内部滚动交互 | 设计决策：时间轴固定侧边栏，不做内部虚拟滚动窗口 |
+| 5 | dot 点击跳转、active、star 功能不可退化 | 基础用户交互 |
 
-```javascript
-// findCriticalElements() 中的关键逻辑 —— 请勿改回 findCommonAncestor
-if (scrollContainer instanceof Element && scrollContainer !== document.body) {
-  this.conversationContainer = this.scrollContainer;  // 强制使用滚动容器
-} else {
-  this.conversationContainer = findCommonAncestor(messages) || document.body;
-}
+---
+
+## 🏗️ 核心架构
+
+### 容器链
+```
+pickScrollContainer(messages)  →  scrollContainer（滚动监听+位置计算）
+findCommonAncestor(messages)   →  conversationContainer（MutationObserver 目标）
+优先级：scrollContainer > commonAncestor > document.body
 ```
 
-**为什么不能用 `findCommonAncestor`？**  
-Claude 新对话只有 1 条消息时，ancestor 会锁定到该消息的直接父 Wrapper，后续兄弟消息全部不在监听范围内。  
-ChatGPT 不需要这个处理，因为它的 `article[data-turn-id]` 是扁平列表结构，`parentElement` 天然就是对话容器。
+### 容器热更新
+- 每次 Mutation 回调触发时调用 `ensureContainersUpToDate()` 检测容器有效性
+- 失效时：全局重新查找 → 保存旧 `scrollContainer` → `rebindObservers({ oldScrollContainer })` → `recalculateAndRenderMarkers()`
+- **关键**：`rebindScrollListener(oldScrollContainer)` 必须用旧引用移除监听，防止泄漏
 
-### 2. 主动容器验证：ensureContainersUpToDate
+### 鱼眼模式渲染（v1.4.0）
+```
+renderDots():
+  maxFitDots = floor(usable / minGap) + 1
+  
+  IF markers.length <= maxFitDots:
+    简单模式：全部独立 dot + applyMinGap
+  ELSE:
+    鱼眼模式：
+      activeIndex = scrubFocusIndex >= 0 ? scrubFocusIndex : activeTurnId 的索引
+      focusSlots = max(1, maxFitDots - 2)
+      计算 focusStart/focusEnd（靠边缘时自动调整）
+      
+      渲染项：
+        上方聚合 dot（如果 focusStart > 0）
+        焦点区独立 dot（focusStart..focusEnd）
+        下方聚合 dot（如果 focusEnd < length-1）
+```
 
-Claude 在用户发送消息并收到回复后，会替换 DOM 容器（React 重渲染）。  
-在每次 MutationObserver 回调中，先调用 `ensureContainersUpToDate()` 主动检测容器是否失效，失效则自动重绑定。  
-**注意**：`ensureContainersUpToDate` 内部使用 `document.querySelectorAll`（全局查询），因为旧容器已脱离 DOM。
+**关键状态**：
+- `fisheyeMode`：当前是否鱼眼模式
+- `focusStart/focusEnd`：焦点窗口范围
+- `scrubFocusIndex`：wheel 刷卡时的临时焦点（-1 = 跟随 active）
 
-### 3. 统一 MutationObserver
+**焦点跟随**：
+- `updateActiveFromScroll/Visible()` 中，active 变化时检查是否越界
+- 越界时调用 `renderDots()` 重新渲染，否则仅 `applyActiveState()` 切换 CSS
+- scroll 事件触发时清除 `scrubFocusIndex`，焦点回到 active
 
-只有一个 `mutationObserver`，回调中智能判断：
-- **有新用户消息** → `requestAnimationFrame` 立即渲染（零延迟）
-- **其他 DOM 变化** → 防抖 250ms 后渲染（避免流式回复频繁触发）
+**Wheel 刷卡**：
+- 鱼眼模式下，时间轴上 wheel 事件被拦截（`preventDefault`）
+- 焦点索引按 SCRUB_STEP=3 移动，触发 `renderDots()`
+- 简单模式下不拦截，正常滚动页面
 
-`rebindObservers()` 仅 disconnect + re-observe，不重建 Observer 实例。
+### 竞态防护
+- 模块级 `ensureTimelineTimerId`：`ensureTimeline()` 的 setTimeout 有 id 追踪
+- `handleUrlChange()`、禁用分支、destroy 前统一 `clearEnsureTimelineTimer()`
 
-### 4. 限定范围查询
-
-`recalculateAndRenderMarkers()` 中使用 `this.conversationContainer.querySelectorAll()`，而非 `document.querySelectorAll()`。  
-减少 DOM 遍历范围，更安全、更快。
+### 防抖统一
+- `ResizeObserver`、`window.resize`、`themeObserver` 全走 `debouncedRecalculate()`（250ms）
+- 新消息走 RAF（不防抖）
 
 ---
 
-## 📋 修复历程
+## 📋 版本历程
 
-| 版本 | 问题 | 根因 | 修复方式 |
-|------|------|------|---------|
-| v1.1.0 | 连续对话后小圆点不更新 | Claude 回复后替换 DOM 容器，Observer 仍监听旧容器 | 在 recalculate 中检测容器失效并重绑定 |
-| v1.2.0 | 新对话首次初始化后小圆点不增加 | 仅 1 条消息时 findCommonAncestor 锁定范围过窄 | 强制使用 ScrollContainer 作为监听目标 |
-| v1.2.0 | 架构优化 | 双 Observer 冗余、全局查询低效 | 合并为单一智能 Observer + 限定范围查询 |
+| 版本 | 关键更新 |
+|------|----------|
+| v1.1-1.2 | 容器热更新、单一 Observer |
+| v1.3 | 密度分桶聚合、竞态防护、监听泄漏修复 |
+| v1.4 | 鱼眼模式（Focus+Context）、wheel 刷卡浏览 |
 
 ---
 
-## 📁 关键文件
+## 📁 文件
 
-- `content.js` — 全部时间轴逻辑（TimelineManager 类）
-- `styles.css` — 时间轴 UI 样式（支持暗色主题）
-- `manifest.json` — Chrome 扩展配置
+- `content.js` — 全部逻辑（TimelineManager + 模块级路由/启停控制）
+- `styles.css` — UI 样式（含 aggregate dot、暗色主题）
+- `OPTIMIZATION_TODO.md` — 后续优化任务清单
