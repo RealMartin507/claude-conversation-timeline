@@ -352,7 +352,7 @@
       this.onTimelineWheel = (ev) => {
         if (!this.fisheyeMode) return; // 简单模式不拦截，正常滚动页面
         ev.preventDefault();
-        
+
         // 初始化 scrubFocusIndex（如果尚未设置）
         if (this.scrubFocusIndex < 0) {
           if (this.activeTurnId) {
@@ -362,7 +362,7 @@
             this.scrubFocusIndex = 0;
           }
         }
-        
+
         const SCRUB_STEP = 3;
         const delta = ev.deltaY > 0 ? SCRUB_STEP : -SCRUB_STEP;
         this.scrubFocusIndex = Math.max(0, Math.min(this.markers.length - 1, this.scrubFocusIndex + delta));
@@ -514,13 +514,17 @@
           markerIds.push(this.markers[i].id);
           sumN += this.markers[i].n;
         }
-        const avgN = sumN / markerIds.length;
-        renderItems.push({ type: 'aggregate', markerIds, naturalN: avgN });
+        // 固定吸附到时间轴顶端，代表整段对话的起点
+        renderItems.push({ type: 'aggregate', markerIds, naturalN: 0 });
       }
 
-      // 焦点区独立 dot
+      // 焦点区独立 dot：将本窗口内的 n 线性拉伸映射到 [0,1]，充满两端聚合 dot 之间的空间
+      const focusStartN = this.markers[focusStart].n;
+      const focusEndN = this.markers[focusEnd].n;
+      const focusRange = Math.max(0.0001, focusEndN - focusStartN);
       for (let i = focusStart; i <= focusEnd; i++) {
-        renderItems.push({ type: 'individual', marker: this.markers[i], naturalN: this.markers[i].n });
+        const remappedN = (this.markers[i].n - focusStartN) / focusRange;
+        renderItems.push({ type: 'individual', marker: this.markers[i], naturalN: remappedN });
       }
 
       if (focusEnd < this.markers.length - 1) {
@@ -531,8 +535,8 @@
           markerIds.push(this.markers[i].id);
           sumN += this.markers[i].n;
         }
-        const avgN = sumN / markerIds.length;
-        renderItems.push({ type: 'aggregate', markerIds, naturalN: avgN });
+        // 固定吸附到时间轴底端，代表整段对话的终点
+        renderItems.push({ type: 'aggregate', markerIds, naturalN: 1 });
       }
 
       // 计算期望位置并施加最小间距
@@ -557,7 +561,7 @@
           dot.className = `${TIMELINE_DOT_CLASS} aggregate`;
           dot.dataset.bucketIndex = String(i); // 使用渲染项索引作为 bucketIndex
           dot.dataset.markerCount = String(item.markerIds.length > 99 ? '99+' : item.markerIds.length);
-          
+
           // 检查是否有 star
           let hasStar = false;
           for (const markerId of item.markerIds) {
@@ -567,13 +571,13 @@
               break;
             }
           }
-          
+
           const firstMarker = this.markerMap.get(item.markerIds[0]);
           const preview = this.truncateText(firstMarker?.summary || '', 120);
           const label = preview ? `${item.markerIds.length} messages: ${preview}` : `${item.markerIds.length} messages`;
           dot.setAttribute('aria-label', label);
           dot.setAttribute('aria-pressed', hasStar ? 'true' : 'false');
-          
+
           if (hasStar) {
             dot.classList.add('starred');
           }
@@ -590,11 +594,11 @@
           dot.dataset.targetTurnId = marker.id;
           dot.setAttribute('aria-label', this.truncateText(marker.summary, 200));
           dot.setAttribute('aria-pressed', marker.starred ? 'true' : 'false');
-          
+
           if (marker.starred) {
             dot.classList.add('starred');
           }
-          
+
           marker.dotElement = dot;
         }
 
@@ -652,7 +656,7 @@
       const readingOffset = this.getCurrentReadingOffset();
       let bestMarker = null;
       let bestDistance = Number.POSITIVE_INFINITY;
-      
+
       for (const marker of this.markers) {
         if (marker.dotElement === dot) {
           const distance = Math.abs(marker.top - readingOffset);
@@ -662,13 +666,13 @@
           }
         }
       }
-      
+
       return bestMarker;
     }
 
     applyActiveState() {
       if (!this.ui.track) return;
-      
+
       const dots = this.ui.track.querySelectorAll(`.${TIMELINE_DOT_CLASS}`);
       dots.forEach((dot) => {
         const targetTurnId = dot.dataset.targetTurnId;
@@ -677,11 +681,11 @@
           dot.classList.toggle('active', targetTurnId === this.activeTurnId);
           return;
         }
-        
+
         // 聚合 dot：检查 active marker 是否在这个聚合组内
         const bucketIndex = Number(dot.dataset.bucketIndex);
         if (!Number.isFinite(bucketIndex)) return;
-        
+
         if (this.activeTurnId) {
           const activeMarker = this.markerMap.get(this.activeTurnId);
           if (activeMarker && activeMarker.dotElement === dot) {
@@ -697,10 +701,10 @@
 
     updateActiveFromScroll() {
       if (!this.scrollContainer || this.markers.length === 0) return;
-      
+
       // 清除 wheel 刷卡的临时焦点索引，回到跟随 active
       this.scrubFocusIndex = -1;
-      
+
       const offset = this.getCurrentReadingOffset();
       let active = this.markers[0];
       for (const m of this.markers) {
@@ -709,7 +713,7 @@
       if (active && active.id !== this.activeTurnId) {
         const oldActiveTurnId = this.activeTurnId;
         this.activeTurnId = active.id;
-        
+
         // 鱼眼模式下，检查 active 是否移出焦点窗口
         if (this.fisheyeMode && oldActiveTurnId !== null) {
           const newIdx = this.markers.findIndex(m => m.id === this.activeTurnId);
@@ -719,7 +723,7 @@
             return;
           }
         }
-        
+
         this.applyActiveState();
       }
     }
@@ -729,10 +733,10 @@
         this.updateActiveFromScroll();
         return;
       }
-      
+
       // 清除 wheel 刷卡的临时焦点索引，回到跟随 active
       this.scrubFocusIndex = -1;
-      
+
       let best = null;
       let bestTop = Number.POSITIVE_INFINITY;
       for (const el of this.visibleUserTurns) {
@@ -754,7 +758,7 @@
       if (marker.id !== this.activeTurnId) {
         const oldActiveTurnId = this.activeTurnId;
         this.activeTurnId = marker.id;
-        
+
         // 鱼眼模式下，检查 active 是否移出焦点窗口
         if (this.fisheyeMode && oldActiveTurnId !== null) {
           const newIdx = this.markers.findIndex(m => m.id === this.activeTurnId);
@@ -764,7 +768,7 @@
             return;
           }
         }
-        
+
         this.applyActiveState();
       }
     }
