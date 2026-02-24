@@ -1,4 +1,4 @@
-# 时间轴架构基线 (v1.4.0 / 2026-02-17)
+# 时间轴架构基线 (v1.4.2 / 2026-02-24)
 
 > **读者**：下一个 AI agent  
 > **范围**：`content.js`（TimelineManager 类）+ `styles.css`
@@ -82,6 +82,8 @@ renderDots():
 | v1.1-1.2 | 容器热更新、单一 Observer |
 | v1.3 | 密度分桶聚合、竞态防护、监听泄漏修复 |
 | v1.4 | 鱼眼模式（Focus+Context）、wheel 刷卡浏览 |
+| v1.4.1 | 鱼眼模式修复边界吸附问题 |
+| v1.4.2 | 修复 2K 宽屏下错误拾取非滚动区域（`pickScrollContainer` 算法重写，优先考虑实际溢出的 `scrollHeight > clientHeight` 及更内侧 DOM） |
 
 ---
 

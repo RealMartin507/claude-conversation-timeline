@@ -871,11 +871,30 @@
 
       if (counts.size === 0) return null;
       let best = null;
-      let bestScore = -1;
+      let bestScore = { count: -1, isOverflowing: false, area: Infinity };
+
       counts.forEach((count, el) => {
         const rect = el.getBoundingClientRect();
-        const score = count * rect.width;
-        if (score > bestScore) { bestScore = score; best = el; }
+        const area = rect.width * rect.height;
+        const isActuallyOverflowing = el.scrollHeight > Math.ceil(el.clientHeight);
+
+        let isBetter = false;
+        if (count > bestScore.count) {
+          isBetter = true;
+        } else if (count === bestScore.count) {
+          if (isActuallyOverflowing && !bestScore.isOverflowing) {
+            isBetter = true;
+          } else if (isActuallyOverflowing === bestScore.isOverflowing) {
+            if (area < bestScore.area) {
+              isBetter = true;
+            }
+          }
+        }
+
+        if (isBetter) {
+          best = el;
+          bestScore = { count, isOverflowing: isActuallyOverflowing, area };
+        }
       });
       return best;
     }
