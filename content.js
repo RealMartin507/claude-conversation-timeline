@@ -723,29 +723,53 @@
       const headerBottom = header ? header.getBoundingClientRect().bottom : 60;
       const viewportHeight = window.innerHeight;
 
-      // 【主策略】找「视口内最顶部的可见用户消息」：
-      //   条件：rect.bottom > headerBottom（消息至少有 1px 显示在 header 以下内容区）
-      //         rect.top < viewportHeight（消息顶部在视口底部以上，即尚未完全滚出）
-      //   markers 已按文档顺序排列，第一个满足条件的就是最顶部的可见条目。
-      //   语义：用户「正在看的第一条用户消息」= 时间轴应高亮的条目。
-      //   与之前 `rect.top <= headerBottom+10` 的区别：
-      //     旧方案要求消息顶部滚过 header 才激活（消息需遮掉约 1/3 才切换）。
-      //     新方案只要消息底部露出 header 以下就激活（消息完整可见时即刻高亮）。
+      // 切换阈值：内容区（header 底部到视口底部）的垂直中点。
+      // 使用动态计算的 CSS 像素值，自动适配所有屏幕尺寸与分辨率（含 2K/4K/HiDPI），
+      // 无需任何硬编码常数，语义始终为「内容区 50% 处」。
+      const midpoint = (headerBottom + viewportHeight) / 2;
+
+      // ━━━ 三阶段 active 查找策略 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      //
+      // 核心判断难点：多条短消息可能同时位于屏幕上半区，必须区分两种情形：
+      //   情形 A（短消息集簇） ：A、B、C 的 top 都在 (headerBottom, midpoint) 内
+      //                         → 应选最顶部的那条（用户刚开始读，从 A 开始）
+      //   情形 B（正常向下滚动）：B 的 top 刚越过中线，A 的 top 已滚过 header
+      //                         → 应选 B（用户正在读 B）
+      //
+      // 分水岭: 消息的 top 是否还在 header 以下（≥ headerBottom）。
+      //   ‣ top ≥ headerBottom → 消息顶部仍在内容区可见 → 属于情形 A
+      //   ‣ top < headerBottom → 消息顶部已滚过 header   → 属于情形 B
+
       let active = null;
+
+      // 【Phase 1 · 主策略】顶部仍在「header 以下 ~ 中线以上」可见区间的第一条消息
+      //   取 FIRST：多条短消息同时满足时，最顶部的那条才是用户正在读的
+      //   触发：消息 top ∈ [headerBottom, midpoint)
       for (const m of this.markers) {
         const rect = m.element.getBoundingClientRect();
-        if (rect.bottom > headerBottom && rect.top < viewportHeight) {
-          active = m; // 文档顺序最靠前 = 视口最顶部的可见消息，取到即退出
-          break;
+        if (rect.top >= headerBottom && rect.top < midpoint) {
+          active = m;
+          break; // 取第一条即止
         }
       }
 
-      // 【回退策略】视口内无用户消息（在长 AI 回复中间滚动的情况）：
-      //   找最后一条「顶部已完全滚过 header」的消息（rect.top <= headerBottom），
-      //   代表上下文中"刚刚读完"的那轮对话。
+      // 【Phase 2 · 次策略】长消息场景：消息顶部已滚过 header，底部仍在视口内
+      //   此时 Phase 1 找不到（没有顶部在可见区的消息），但用户仍在读这条大 AI 回复下方的用户消息
+      //   取 LAST：遍历所有满足条件的，越靠下的越新（下翻时切到 B 当 B.top < midpoint）
       if (!active) {
         for (const m of this.markers) {
-          if (m.element.getBoundingClientRect().top <= headerBottom) active = m;
+          const rect = m.element.getBoundingClientRect();
+          if (rect.top < midpoint && rect.bottom > headerBottom) {
+            active = m; // 不 break，取最靠下那条
+          }
+        }
+      }
+
+      // 【Phase 3 · 兜底】所有消息都在中线以下或视口之外时
+      //   找最后一条顶部已完全滚过 header 的消息，代表上下文中「刚刚读完」的那轮对话
+      if (!active) {
+        for (const m of this.markers) {
+          if (m.element.getBoundingClientRect().top < headerBottom) active = m;
         }
       }
 
