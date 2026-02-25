@@ -45,6 +45,9 @@
       this.pressTargetMarkerId = null;
       this.longPressTriggered = false;
       this.suppressClickUntil = 0;
+      // 点击 dot 后的锁定截止时间戳（ms）
+      // 锁定期内禁止 scroll 事件覆盖 activeTurnId，防止动画中途闪烁到错误条目
+      this.scrollLockUntil = 0;
 
       this.conversationId = this.extractConversationIdFromPath(location.pathname);
       this.visibleRange = { start: 0, end: -1 };
@@ -263,7 +266,15 @@
         const now = Date.now();
         if (now < this.suppressClickUntil) return;
         const marker = this.resolveMarkerForDot(dot);
-        if (marker && marker.element) this.smoothScrollTo(marker.element);
+        if (marker && marker.element) {
+          // 立即将 activeTurnId 设为点击目标，避免 smoothScrollTo 动画（500ms）期间
+          // scroll 事件触发 updateActiveFromScroll，因偏移量偏差误选到下一条
+          this.activeTurnId = marker.id;
+          // 锁定 800ms（动画 500ms + 150ms 余量），期间屏蔽 scroll 驱动的 active 更新
+          this.scrollLockUntil = Date.now() + 800;
+          this.applyActiveState();
+          this.smoothScrollTo(marker.element);
+        }
       };
       this.ui.bar.addEventListener('click', this.onClick);
 
@@ -702,14 +713,44 @@
     updateActiveFromScroll() {
       if (!this.scrollContainer || this.markers.length === 0) return;
 
+      // 点击 dot 后的锁定期内：activeTurnId 已由 onClick 直接设好，禁止 scroll 覆盖
+      if (Date.now() < this.scrollLockUntil) return;
+
       // 清除 wheel 刷卡的临时焦点索引，回到跟随 active
       this.scrubFocusIndex = -1;
 
-      const offset = this.getCurrentReadingOffset();
-      let active = this.markers[0];
+      const header = document.querySelector('header[data-testid="page-header"]');
+      const headerBottom = header ? header.getBoundingClientRect().bottom : 60;
+      const viewportHeight = window.innerHeight;
+
+      // 【主策略】找「视口内最顶部的可见用户消息」：
+      //   条件：rect.bottom > headerBottom（消息至少有 1px 显示在 header 以下内容区）
+      //         rect.top < viewportHeight（消息顶部在视口底部以上，即尚未完全滚出）
+      //   markers 已按文档顺序排列，第一个满足条件的就是最顶部的可见条目。
+      //   语义：用户「正在看的第一条用户消息」= 时间轴应高亮的条目。
+      //   与之前 `rect.top <= headerBottom+10` 的区别：
+      //     旧方案要求消息顶部滚过 header 才激活（消息需遮掉约 1/3 才切换）。
+      //     新方案只要消息底部露出 header 以下就激活（消息完整可见时即刻高亮）。
+      let active = null;
       for (const m of this.markers) {
-        if (m.top <= offset) active = m;
+        const rect = m.element.getBoundingClientRect();
+        if (rect.bottom > headerBottom && rect.top < viewportHeight) {
+          active = m; // 文档顺序最靠前 = 视口最顶部的可见消息，取到即退出
+          break;
+        }
       }
+
+      // 【回退策略】视口内无用户消息（在长 AI 回复中间滚动的情况）：
+      //   找最后一条「顶部已完全滚过 header」的消息（rect.top <= headerBottom），
+      //   代表上下文中"刚刚读完"的那轮对话。
+      if (!active) {
+        for (const m of this.markers) {
+          if (m.element.getBoundingClientRect().top <= headerBottom) active = m;
+        }
+      }
+
+      if (!active) active = this.markers[0]; // 兜底
+
       if (active && active.id !== this.activeTurnId) {
         const oldActiveTurnId = this.activeTurnId;
         this.activeTurnId = active.id;
@@ -718,7 +759,6 @@
         if (this.fisheyeMode && oldActiveTurnId !== null) {
           const newIdx = this.markers.findIndex(m => m.id === this.activeTurnId);
           if (newIdx >= 0 && (newIdx < this.focusStart || newIdx > this.focusEnd)) {
-            // 焦点窗口需要移动，重新渲染
             this.renderDots();
             return;
           }
@@ -729,48 +769,11 @@
     }
 
     updateActiveFromVisible() {
-      if (this.visibleUserTurns.size === 0) {
-        this.updateActiveFromScroll();
-        return;
-      }
-
-      // 清除 wheel 刷卡的临时焦点索引，回到跟随 active
-      this.scrubFocusIndex = -1;
-
-      let best = null;
-      let bestTop = Number.POSITIVE_INFINITY;
-      for (const el of this.visibleUserTurns) {
-        const top = this.getElementTop(el);
-        if (top < bestTop) {
-          bestTop = top;
-          best = el;
-        }
-      }
-      if (!best) {
-        this.updateActiveFromScroll();
-        return;
-      }
-      const marker = this.markers.find(m => m.element === best);
-      if (!marker) {
-        this.updateActiveFromScroll();
-        return;
-      }
-      if (marker.id !== this.activeTurnId) {
-        const oldActiveTurnId = this.activeTurnId;
-        this.activeTurnId = marker.id;
-
-        // 鱼眼模式下，检查 active 是否移出焦点窗口
-        if (this.fisheyeMode && oldActiveTurnId !== null) {
-          const newIdx = this.markers.findIndex(m => m.id === this.activeTurnId);
-          if (newIdx >= 0 && (newIdx < this.focusStart || newIdx > this.focusEnd)) {
-            // 焦点窗口需要移动，重新渲染
-            this.renderDots();
-            return;
-          }
-        }
-
-        this.applyActiveState();
-      }
+      // IntersectionObserver 以前兼管"选哪条 active"，但 rootMargin '-40% 0px -59%'
+      // 使命中窗口极窄，消息进出时异步报告不稳定，导致滚动时闪烁。
+      // 现在 active 检测已全部迁至 updateActiveFromScroll（实时视口坐标），
+      // updateActiveFromVisible 仅作为 IntersectionObserver 触发时的转发入口。
+      this.updateActiveFromScroll();
     }
 
     scheduleActiveSync() {
@@ -982,7 +985,14 @@
       const isWindowScroll = this.scrollContainer === document.body || this.scrollContainer === document.documentElement || this.scrollContainer === document.scrollingElement;
       const containerTop = isWindowScroll ? window.scrollY : this.scrollContainer.scrollTop;
       const containerHeight = isWindowScroll ? window.innerHeight : this.scrollContainer.clientHeight;
-      return containerTop + containerHeight * 0.35;
+      // 使用实际 header 高度作为偏移量（而非 viewportHeight * 0.35）
+      // 原理：smoothScrollTo 把目标元素定位到 scrollTop = m.top - headerOffset 处
+      //       若 readingOffset = scrollTop + 0.35*H，则远超下一条消息 top，系统性选错
+      //       改为 scrollTop + headerOffset 后：readingOffset ≈ m.top，与定位公式完全对齐
+      //       从根本上消除对短消息的 off-by-one 选择错误
+      const header = document.querySelector('header[data-testid="page-header"]');
+      const headerOffset = header ? Math.round(header.getBoundingClientRect().height) + 2 : 60;
+      return containerTop + headerOffset;
     }
 
     truncateText(text, maxLen = 200) {
