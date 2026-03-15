@@ -1,4 +1,4 @@
-# 时间轴架构基线 (v1.4.2 / 2026-02-24)
+# 时间轴架构基线 (v1.4.3 / 2026-03-15)
 
 > **读者**：下一个 AI agent  
 > **范围**：`content.js`（TimelineManager 类）+ `styles.css`
@@ -65,9 +65,24 @@ renderDots():
 - 焦点索引按 SCRUB_STEP=3 移动，触发 `renderDots()`
 - 简单模式下不拦截，正常滚动页面
 
+### SPA 路由切换初始化（v1.4.3 重写）
+
+**现象**：Claude 切换对话时 URL 先变，但 React 是**原地替换**消息节点（不先清空），旧消息 element 会短暂残留 DOM，导致新 `TimelineManager` 拿到旧消息初始化，dot 混乱。
+
+**解法**：`handleUrlChange()` 时抓住旧对话**第一条消息的 element 引用**（`staleFirstMessage`），用 `MutationObserver`（`domSwapObserver`）监听它何时脱离 DOM，一旦脱离立即初始化新时间轴。2s 超时兜底。
+
+**关键变量**（模块级）：
+- `staleFirstMessage`：旧对话首条消息 element，`null` = 无需等待
+- `domSwapObserver`：监听 `staleFirstMessage` 脱离的 MutationObserver
+- `domSwapDeadline`：超时截止时间戳
+
+**绝对不要**：
+- 不要改回"等消息数量归零"策略——Claude SPA 消息从不归零，会卡满 2s
+- `stopDomSwapObserver()` 必须在 `handleUrlChange` 和 `ensureTimeline` 退出路径都调用，防止 observer 泄漏
+
 ### 竞态防护
 - 模块级 `ensureTimelineTimerId`：`ensureTimeline()` 的 setTimeout 有 id 追踪
-- `handleUrlChange()`、禁用分支、destroy 前统一 `clearEnsureTimelineTimer()`
+- `handleUrlChange()`、禁用分支、destroy 前统一 `clearEnsureTimelineTimer()` + `stopDomSwapObserver()`
 
 ### 防抖统一
 - `ResizeObserver`、`window.resize`、`themeObserver` 全走 `debouncedRecalculate()`（250ms）
@@ -84,6 +99,7 @@ renderDots():
 | v1.4 | 鱼眼模式（Focus+Context）、wheel 刷卡浏览 |
 | v1.4.1 | 鱼眼模式修复边界吸附问题 |
 | v1.4.2 | 修复 2K 宽屏下错误拾取非滚动区域（`pickScrollContainer` 算法重写，优先考虑实际溢出的 `scrollHeight > clientHeight` 及更内侧 DOM） |
+| v1.4.3 | 修复切换对话时 dot 混乱：用 `staleFirstMessage` element 引用 + `domSwapObserver` 等待 React 完成路由替换，替代无效的"等消息数归零"策略；全面添加 `[Timeline]` debug 日志 |
 
 ---
 

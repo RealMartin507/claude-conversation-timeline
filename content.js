@@ -63,20 +63,28 @@
     }
 
     async init() {
+      console.log(`[Timeline] init() 开始，conversationId=${this.extractConversationIdFromPath(location.pathname)}, url=${location.href}`);
+      const t0 = Date.now();
       const ok = await this.findCriticalElements();
-      if (!ok) return;
+      if (!ok) {
+        console.warn(`[Timeline] init() 失败：找不到关键元素（超时），耗时=${Date.now() - t0}ms`);
+        return;
+      }
+      console.log(`[Timeline] 找到关键元素，耗时=${Date.now() - t0}ms, scrollContainer=${this.scrollContainer?.tagName}#${this.scrollContainer?.id || ''}.${[...this.scrollContainer?.classList||[]].join('.')}, conversationContainer=${this.conversationContainer?.tagName}`);
       this.injectTimelineUI();
       this.setupEventListeners();
       this.setupObservers();
       this.conversationId = this.extractConversationIdFromPath(location.pathname);
       this.loadStars();
       this.recalculateAndRenderMarkers();
+      console.log(`[Timeline] init() 完成，总耗时=${Date.now() - t0}ms, markers=${this.markers.length}`);
     }
 
     async findCriticalElements() {
       const firstMessage = await this.waitForElement(USER_MESSAGE_SELECTOR);
       if (!firstMessage) return false;
       const messages = Array.from(document.querySelectorAll(USER_MESSAGE_SELECTOR));
+      console.log(`[Timeline] findCriticalElements: 找到 ${messages.length} 条用户消息`);
       this.scrollContainer = this.pickScrollContainer(messages) || document.scrollingElement || document.documentElement || document.body;
 
       // 关键修复：如果找到了特定的滚动容器（非body），优先将其作为观察对象
@@ -91,6 +99,7 @@
         this.conversationContainer = common || document.body;
       }
 
+      console.log(`[Timeline] findCriticalElements: scrollContainer=${this.scrollContainer?.tagName}#${this.scrollContainer?.id||''}[overflow-y=${window.getComputedStyle(this.scrollContainer||document.body).overflowY}], conversationContainer=${this.conversationContainer?.tagName}`);
       return true;
     }
 
@@ -178,7 +187,7 @@
       if (this.conversationContainer && document.body.contains(this.conversationContainer)) return;
 
       // 容器已失效（被 Claude 替换），需要重新查找
-      console.log('[Timeline] Container lost, rebinding observers...');
+      console.warn(`[Timeline] conversationContainer 已脱离 DOM，开始重新查找... (url=${location.href})`);
       // 注意：此处必须用全局查询，因为旧容器已脱离 DOM
       const messages = Array.from(document.querySelectorAll(USER_MESSAGE_SELECTOR));
       if (messages.length === 0) return;
@@ -200,6 +209,7 @@
 
       const scrollChanged = nextScrollContainer !== this.scrollContainer;
       const containerChanged = newContainer !== this.conversationContainer;
+      console.log(`[Timeline] ensureContainersUpToDate: 消息数=${messages.length}, scrollChanged=${scrollChanged}, containerChanged=${containerChanged}, newContainer=${newContainer?.tagName}`);
       if (scrollChanged || containerChanged) {
         const oldScroll = this.scrollContainer;
         this.scrollContainer = nextScrollContainer;
@@ -219,7 +229,7 @@
       }
       if (rebindScroll) this.rebindScrollListener(oldScrollContainer);
       if (rebuildIntersection) this.rebuildIntersectionObserver();
-      console.log('[Timeline] Observers rebound to new container');
+      console.log(`[Timeline] rebindObservers 完成: rebindScroll=${rebindScroll}, rebuildIntersection=${rebuildIntersection}`);
     }
 
     rebindScrollListener(oldScrollContainer = null) {
@@ -387,12 +397,14 @@
 
       // 安全检查：确保容器仍有效（主要验证已在 Mutation 回调的 ensureContainersUpToDate 中完成）
       if (!document.body.contains(this.conversationContainer)) {
+        console.warn(`[Timeline] recalculateAndRenderMarkers: conversationContainer 已脱离 DOM，触发 ensureContainersUpToDate`);
         this.ensureContainersUpToDate();
       }
 
       // 限定范围查询：仅在 conversationContainer 内搜索，避免全局 DOM 扫描
       const elements = Array.from(this.conversationContainer.querySelectorAll(USER_MESSAGE_SELECTOR));
       if (elements.length === 0) {
+        console.log(`[Timeline] recalculateAndRenderMarkers: 容器内无用户消息，清空 markers`);
         this.markers = [];
         this.markerMap.clear();
         this.densityBuckets = [];
@@ -432,6 +444,7 @@
         return marker;
       });
 
+      console.log(`[Timeline] recalculateAndRenderMarkers: 生成 ${this.markers.length} 个 markers, conversationId=${this.conversationId}`);
       this.renderDots();
       this.updateIntersectionObserverTargets();
       this.activeTurnId = null;
@@ -1090,10 +1103,23 @@
     waitForElement(selector, timeout = 10000) {
       return new Promise((resolve) => {
         const start = Date.now();
+        let warnLogged = false;
         const tick = () => {
           const el = document.querySelector(selector);
-          if (el) return resolve(el);
-          if (Date.now() - start > timeout) return resolve(null);
+          if (el) {
+            const elapsed = Date.now() - start;
+            if (elapsed > 500) console.log(`[Timeline] waitForElement("${selector}"): 找到，耗时=${elapsed}ms`);
+            return resolve(el);
+          }
+          const elapsed = Date.now() - start;
+          if (!warnLogged && elapsed > 2000) {
+            warnLogged = true;
+            console.warn(`[Timeline] waitForElement("${selector}"): 等待超过 2s，仍未出现 (url=${location.href})`);
+          }
+          if (elapsed > timeout) {
+            console.error(`[Timeline] waitForElement("${selector}"): 超时 ${timeout}ms，放弃`);
+            return resolve(null);
+          }
           requestAnimationFrame(tick);
         };
         tick();
@@ -1167,21 +1193,74 @@
 
   const initializeTimeline = () => {
     if (timelineInstance) return;
+    console.log(`[Timeline] initializeTimeline: 创建新实例, url=${location.href}`);
     timelineInstance = new TimelineManager();
     timelineInstance.init();
+  };
+
+  // 切换对话时，记录旧对话第一条消息的 element 引用
+  // 等该 element 脱离 DOM（React unmount 完成），再初始化新时间轴
+  // 这比"等消息全部消失"更精准——Claude SPA 是原地替换，消息不会先全消失再出现
+  let staleFirstMessage = null;
+  let domSwapObserver = null;
+  let domSwapDeadline = 0;
+
+  const stopDomSwapObserver = () => {
+    if (domSwapObserver) {
+      try { domSwapObserver.disconnect(); } catch { }
+      domSwapObserver = null;
+    }
   };
 
   const ensureTimeline = () => {
     if (!isConversationRoute() || !timelineActive || !providerEnabled) {
       clearEnsureTimelineTimer();
+      stopDomSwapObserver();
       return;
     }
     if (timelineInstance) {
       clearEnsureTimelineTimer();
+      stopDomSwapObserver();
       return;
+    }
+    // 如果有旧消息 element 的引用，等它脱离 DOM（最多等 2s）
+    if (staleFirstMessage) {
+      if (document.body.contains(staleFirstMessage) && Date.now() < domSwapDeadline) {
+        // 用 MutationObserver 监听，一旦旧消息被 React unmount 立即触发
+        if (!domSwapObserver) {
+          console.log(`[Timeline] ensureTimeline: 旧消息 element 仍在 DOM，等待 React 完成替换...`);
+          domSwapObserver = new MutationObserver(() => {
+            if (!document.body.contains(staleFirstMessage)) {
+              console.log(`[Timeline] ensureTimeline: 旧消息 element 已脱离 DOM，React 替换完成`);
+              stopDomSwapObserver();
+              staleFirstMessage = null;
+              clearEnsureTimelineTimer();
+              ensureTimeline();
+            }
+          });
+          domSwapObserver.observe(document.body, { childList: true, subtree: true });
+          // 超时兜底（通常 React 替换很快，不应触发）
+          clearEnsureTimelineTimer();
+          ensureTimelineTimerId = setTimeout(() => {
+            ensureTimelineTimerId = null;
+            if (staleFirstMessage) {
+              console.warn(`[Timeline] ensureTimeline: 等待旧消息脱离 DOM 超时（2s），强制继续`);
+              stopDomSwapObserver();
+              staleFirstMessage = null;
+              ensureTimeline();
+            }
+          }, domSwapDeadline - Date.now() + 50);
+        }
+        return;
+      }
+      // 已脱离 DOM 或超时
+      stopDomSwapObserver();
+      staleFirstMessage = null;
+      console.log(`[Timeline] ensureTimeline: 旧消息已脱离 DOM，继续初始化`);
     }
     const hasMessages = document.querySelector(USER_MESSAGE_SELECTOR);
     if (!hasMessages) {
+      console.log(`[Timeline] ensureTimeline: 新消息尚未出现，等待...`);
       clearEnsureTimelineTimer();
       ensureTimelineTimerId = setTimeout(() => {
         ensureTimelineTimerId = null;
@@ -1189,6 +1268,7 @@
       }, 400);
       return;
     }
+    console.log(`[Timeline] ensureTimeline: 检测到新消息（共 ${document.querySelectorAll(USER_MESSAGE_SELECTOR).length} 条），初始化时间轴`);
     clearEnsureTimelineTimer();
     initializeTimeline();
     requestAnimationFrame(() => {
@@ -1198,20 +1278,37 @@
 
   const handleUrlChange = () => {
     if (location.href === currentUrl) return;
+    const prevUrl = currentUrl;
     currentUrl = location.href;
+    console.log(`[Timeline] handleUrlChange: ${prevUrl} → ${currentUrl}`);
     clearEnsureTimelineTimer();
+    stopDomSwapObserver();
     if (timelineInstance) {
+      console.log(`[Timeline] handleUrlChange: 销毁旧实例`);
       try { timelineInstance.destroy(); } catch { }
       timelineInstance = null;
     }
     if (isConversationRoute() && timelineActive && providerEnabled) {
+      // 记录当前第一条消息的引用，用于检测 React 何时完成路由替换
+      const firstOldMsg = document.querySelector(USER_MESSAGE_SELECTOR);
+      staleFirstMessage = firstOldMsg || null;
+      domSwapDeadline = Date.now() + 2000;
+      if (staleFirstMessage) {
+        console.log(`[Timeline] handleUrlChange: 记录旧消息 element（DOM 中共 ${document.querySelectorAll(USER_MESSAGE_SELECTOR).length} 条），等待 React 替换`);
+      } else {
+        console.log(`[Timeline] handleUrlChange: DOM 中无旧消息，直接初始化`);
+      }
       ensureTimeline();
+    } else {
+      staleFirstMessage = null;
+      console.log(`[Timeline] handleUrlChange: 非对话路由或插件已禁用，跳过初始化 (route=${isConversationRoute()}, active=${timelineActive}, provider=${providerEnabled})`);
     }
   };
 
   const attachRouteListeners = () => {
     if (routeListenersAttached) return;
     routeListenersAttached = true;
+    console.log(`[Timeline] attachRouteListeners: 开始监听路由变化`);
     const observer = new MutationObserver(handleUrlChange);
     observer.observe(document.body, { childList: true, subtree: true });
     setInterval(handleUrlChange, 1000);
@@ -1222,7 +1319,9 @@
   const boot = () => {
     if (booted) return;
     booted = true;
+    console.log(`[Timeline] boot: 启动, readyState=${document.readyState}, url=${location.href}`);
     const ready = () => {
+      console.log(`[Timeline] boot/ready: isConversationRoute=${isConversationRoute()}, timelineActive=${timelineActive}, providerEnabled=${providerEnabled}`);
       if (isConversationRoute() && timelineActive && providerEnabled) {
         ensureTimeline();
       }
