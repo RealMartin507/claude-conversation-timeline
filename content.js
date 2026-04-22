@@ -48,6 +48,124 @@
       this.debouncedRecalculate = this.debounce(() => this.recalculateAndRenderMarkers(), 250);
     }
 
+    getUserMessages(root = document) {
+      const scope = root?.querySelectorAll ? root : document;
+      const all = Array.from(scope.querySelectorAll(USER_MESSAGE_SELECTOR));
+      return all.filter((el) => {
+        if (!(el instanceof Element) || !el.isConnected) return false;
+        const text = this.normalizeText(el.textContent || '');
+        if (!text) return false;
+        let rect = null;
+        let cs = null;
+        try {
+          rect = el.getBoundingClientRect();
+          cs = window.getComputedStyle(el);
+        } catch {
+          return false;
+        }
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return false;
+        return true;
+      });
+    }
+
+    async waitForConversationReady(expectedConversationId = this.conversationId, timeout = 10000) {
+      const start = Date.now();
+      let stableCount = -1;
+      let stablePasses = 0;
+
+      while (Date.now() - start <= timeout) {
+        if (this.extractConversationIdFromPath(location.pathname) !== expectedConversationId) return false;
+        const messages = this.getUserMessages(document);
+        if (messages.length > 0) {
+          const nextScrollContainer = this.pickScrollContainer(messages) || document.scrollingElement || document.documentElement || document.body;
+          const canUseContainer = this.isWindowScrollTarget(nextScrollContainer) || ((nextScrollContainer.scrollHeight - nextScrollContainer.clientHeight) > 8) || messages.length === 1;
+          if (canUseContainer) {
+            if (messages.length === stableCount) stablePasses++;
+            else {
+              stableCount = messages.length;
+              stablePasses = 0;
+            }
+            if (stablePasses >= 2) return true;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+
+      return false;
+    }
+
+    isWindowScrollTarget(el) {
+      return el === document.body || el === document.documentElement || el === document.scrollingElement;
+    }
+
+    bindScrollListener() {
+      if (!this.scrollContainer || !this.onScroll) return;
+      this.scrollContainer.addEventListener('scroll', this.onScroll, { passive: true });
+    }
+
+    unbindScrollListener() {
+      if (!this.scrollContainer || !this.onScroll) return;
+      try { this.scrollContainer.removeEventListener('scroll', this.onScroll); } catch { }
+    }
+
+    rebuildIntersectionObserver() {
+      try { this.intersectionObserver?.disconnect(); } catch { }
+      if (!this.scrollContainer) {
+        this.intersectionObserver = null;
+        return;
+      }
+
+      const isWindowScroll = this.isWindowScrollTarget(this.scrollContainer);
+      this.intersectionObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            this.visibleUserTurns.add(entry.target);
+          } else {
+            this.visibleUserTurns.delete(entry.target);
+          }
+        }
+        this.scheduleActiveSync();
+      }, {
+        root: isWindowScroll ? null : this.scrollContainer,
+        threshold: 0.1,
+        rootMargin: '-40% 0px -59% 0px'
+      });
+
+      this.updateIntersectionObserverTargets();
+    }
+
+    refreshContainerBindings() {
+      const messages = this.getUserMessages(document);
+      if (messages.length === 0) return false;
+
+      const nextScrollContainer = this.pickScrollContainer(messages) || document.scrollingElement || document.documentElement || document.body;
+      const common = this.findCommonAncestor(messages);
+      const nextConversationContainer = !this.isWindowScrollTarget(nextScrollContainer)
+        ? nextScrollContainer
+        : (common || document.body);
+
+      const scrollChanged = nextScrollContainer !== this.scrollContainer;
+      const conversationChanged = nextConversationContainer !== this.conversationContainer;
+
+      if (scrollChanged) {
+        this.unbindScrollListener();
+        this.scrollContainer = nextScrollContainer;
+        this.bindScrollListener();
+        if (this.intersectionObserver) this.rebuildIntersectionObserver();
+      }
+
+      if (conversationChanged) {
+        this.conversationContainer = nextConversationContainer;
+        if (this.mutationObserver) {
+          try { this.mutationObserver.disconnect(); } catch { }
+          this.mutationObserver.observe(this.conversationContainer, { childList: true, subtree: true });
+        }
+      }
+
+      return scrollChanged || conversationChanged;
+    }
+
     async init() {
       const ok = await this.findCriticalElements();
       if (!ok) return;
@@ -60,24 +178,11 @@
     }
 
     async findCriticalElements() {
-      const firstMessage = await this.waitForElement(USER_MESSAGE_SELECTOR);
-      if (!firstMessage) return false;
-      const messages = Array.from(document.querySelectorAll(USER_MESSAGE_SELECTOR));
-      this.scrollContainer = this.pickScrollContainer(messages) || document.scrollingElement || document.documentElement || document.body;
-
-      // 关键修复：如果找到了特定的滚动容器（非body），优先将其作为观察对象
-      // 这避免了在只有一条消息时，findCommonAncestor 错误地锁定到消息的直接父Wrapper，导致后续兄弟消息无法被监听
-      const common = this.findCommonAncestor(messages);
-      if (this.scrollContainer instanceof Element &&
-        this.scrollContainer !== document.body &&
-        this.scrollContainer !== document.documentElement &&
-        this.scrollContainer !== document.scrollingElement) {
-        this.conversationContainer = this.scrollContainer;
-      } else {
-        this.conversationContainer = common || document.body;
-      }
-
-      return true;
+      this.conversationId = this.extractConversationIdFromPath(location.pathname);
+      const ready = await this.waitForConversationReady(this.conversationId);
+      if (!ready) return false;
+      this.refreshContainerBindings();
+      return !!this.scrollContainer && !!this.conversationContainer;
     }
 
     injectTimelineUI() {
@@ -155,51 +260,17 @@
         this.themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme'] });
       } catch { }
 
-      const isWindowScroll = this.scrollContainer === document.body || this.scrollContainer === document.documentElement || this.scrollContainer === document.scrollingElement;
-      this.intersectionObserver = new IntersectionObserver((entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting) {
-            this.visibleUserTurns.add(entry.target);
-          } else {
-            this.visibleUserTurns.delete(entry.target);
-          }
-        }
-        this.scheduleActiveSync();
-      }, {
-        root: isWindowScroll ? null : this.scrollContainer,
-        threshold: 0.1,
-        rootMargin: '-40% 0px -59% 0px'
-      });
-
-      this.updateIntersectionObserverTargets();
+      this.rebuildIntersectionObserver();
     }
 
     // 主动检查容器有效性（每次 Mutation 回调时调用）
     ensureContainersUpToDate() {
-      if (this.conversationContainer && document.body.contains(this.conversationContainer)) return;
+      const conversationAlive = this.conversationContainer && document.body.contains(this.conversationContainer);
+      const scrollAlive = this.scrollContainer && (this.isWindowScrollTarget(this.scrollContainer) || document.body.contains(this.scrollContainer));
+      if (conversationAlive && scrollAlive) return;
 
-      // 容器已失效（被 Claude 替换），需要重新查找
-      console.log('[Timeline] Container lost, rebinding observers...');
-      // 注意：此处必须用全局查询，因为旧容器已脱离 DOM
-      const messages = Array.from(document.querySelectorAll(USER_MESSAGE_SELECTOR));
-      if (messages.length === 0) return;
-
-      const common = this.findCommonAncestor(messages);
-      let newContainer = common || document.body;
-
-      // 优先使用 ScrollContainer（确保监听范围覆盖所有消息）
-      if (this.scrollContainer instanceof Element &&
-        this.scrollContainer !== document.body &&
-        this.scrollContainer !== document.documentElement &&
-        this.scrollContainer !== document.scrollingElement) {
-        if (!common || this.scrollContainer.contains(common)) {
-          newContainer = this.scrollContainer;
-        }
-      }
-
-      if (newContainer !== this.conversationContainer) {
-        this.conversationContainer = newContainer;
-        this.rebindObservers();
+      if (this.refreshContainerBindings()) {
+        console.log('[Timeline] Container bindings refreshed');
       }
     }
 
@@ -217,7 +288,7 @@
 
     setupEventListeners() {
       this.onScroll = () => this.scheduleActiveSync();
-      this.scrollContainer.addEventListener('scroll', this.onScroll, { passive: true });
+      this.bindScrollListener();
 
       this.onClick = (e) => {
         const dot = e.target.closest(`.${TIMELINE_DOT_CLASS}`);
@@ -318,13 +389,14 @@
     recalculateAndRenderMarkers() {
       if (!this.ui.track || !this.conversationContainer) return;
 
-      // 安全检查：确保容器仍有效（主要验证已在 Mutation 回调的 ensureContainersUpToDate 中完成）
-      if (!document.body.contains(this.conversationContainer)) {
-        this.ensureContainersUpToDate();
-      }
+      this.refreshContainerBindings();
 
       // 限定范围查询：仅在 conversationContainer 内搜索，避免全局 DOM 扫描
-      const elements = Array.from(this.conversationContainer.querySelectorAll(USER_MESSAGE_SELECTOR));
+      let elements = this.getUserMessages(this.conversationContainer);
+      if (elements.length === 0) {
+        this.refreshContainerBindings();
+        elements = this.getUserMessages(this.conversationContainer);
+      }
       if (elements.length === 0) return;
 
       const positions = elements.map(el => this.getElementTop(el));
@@ -398,7 +470,7 @@
 
     updateActiveFromScroll() {
       if (!this.scrollContainer || this.markers.length === 0) return;
-      const containerTop = this.scrollContainer === document.body || this.scrollContainer === document.documentElement || this.scrollContainer === document.scrollingElement
+      const containerTop = this.isWindowScrollTarget(this.scrollContainer)
         ? window.scrollY
         : this.scrollContainer.scrollTop;
       const offset = containerTop + this.scrollContainer.clientHeight * 0.35;
@@ -464,9 +536,10 @@
     }
 
     smoothScrollTo(targetElement, duration = 500) {
+      this.refreshContainerBindings();
       const containerRect = this.scrollContainer.getBoundingClientRect();
       const targetRect = targetElement.getBoundingClientRect();
-      const isWindowScroll = this.scrollContainer === document.body || this.scrollContainer === document.documentElement || this.scrollContainer === document.scrollingElement;
+      const isWindowScroll = this.isWindowScrollTarget(this.scrollContainer);
       const currentScrollTop = isWindowScroll ? window.scrollY : this.scrollContainer.scrollTop;
       const header = document.querySelector('header[data-testid="page-header"]');
       const headerOffset = header ? Math.round(header.getBoundingClientRect().height) + 2 : 0;
@@ -495,7 +568,7 @@
 
     getElementTop(el) {
       const rect = el.getBoundingClientRect();
-      const isWindowScroll = this.scrollContainer === document.body || this.scrollContainer === document.documentElement || this.scrollContainer === document.scrollingElement;
+      const isWindowScroll = this.isWindowScrollTarget(this.scrollContainer);
       if (isWindowScroll) return rect.top + window.scrollY;
       const containerRect = this.scrollContainer.getBoundingClientRect();
       return rect.top - containerRect.top + this.scrollContainer.scrollTop;
@@ -527,7 +600,8 @@
         const cs = window.getComputedStyle(el);
         if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') return false;
         const rect = el.getBoundingClientRect();
-        return rect.width > 400 && rect.height > 200;
+        const scrollableDistance = el.scrollHeight - el.clientHeight;
+        return rect.width > 400 && rect.height > 200 && scrollableDistance > 8;
       };
 
       const counts = new Map();
@@ -753,6 +827,7 @@
   let timelineActive = true;
   let providerEnabled = true;
   let routeListenersAttached = false;
+  let pendingEnsureTimer = null;
 
   const isConversationRoute = (pathname = location.pathname) => {
     return /^\/chat\/[A-Za-z0-9_-]+/.test(pathname);
@@ -769,7 +844,11 @@
     if (timelineInstance) return;
     const hasMessages = document.querySelector(USER_MESSAGE_SELECTOR);
     if (!hasMessages) {
-      setTimeout(ensureTimeline, 400);
+      if (pendingEnsureTimer) clearTimeout(pendingEnsureTimer);
+      pendingEnsureTimer = setTimeout(() => {
+        pendingEnsureTimer = null;
+        ensureTimeline();
+      }, 400);
       return;
     }
     initializeTimeline();
@@ -781,12 +860,19 @@
   const handleUrlChange = () => {
     if (location.href === currentUrl) return;
     currentUrl = location.href;
+    if (pendingEnsureTimer) {
+      clearTimeout(pendingEnsureTimer);
+      pendingEnsureTimer = null;
+    }
     if (timelineInstance) {
       try { timelineInstance.destroy(); } catch { }
       timelineInstance = null;
     }
     if (isConversationRoute() && timelineActive && providerEnabled) {
-      ensureTimeline();
+      pendingEnsureTimer = setTimeout(() => {
+        pendingEnsureTimer = null;
+        ensureTimeline();
+      }, 500);
     }
   };
 
