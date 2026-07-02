@@ -18,5 +18,8 @@ Thumbs.db
 # Kiro AI assistant (personal workspace)
 .kiro/
 
+# Claude local settings and scratch files
+.claude/
+
 # Agent workspace
 .agent/
