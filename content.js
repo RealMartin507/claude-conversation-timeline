@@ -14,6 +14,8 @@
       this.activeTurnId = null;
       this.starred = new Set();
       this.markerMap = new Map();
+      // hash(文本指纹) -> 已分配的 id 队列，跨越挂载/卸载持久化，用于合并时稳定复用 id
+      this.hashToIds = new Map();
       this.ui = { bar: null, track: null, tooltip: null };
 
       this.mutationObserver = null;
@@ -276,14 +278,20 @@
         const now = Date.now();
         if (now < this.suppressClickUntil) return;
         const marker = this.resolveMarkerForDot(dot);
-        if (marker && marker.element) {
-          // 立即将 activeTurnId 设为点击目标，避免 smoothScrollTo 动画（500ms）期间
+        if (marker) {
+          // 立即将 activeTurnId 设为点击目标，避免滚动动画期间
           // scroll 事件触发 updateActiveFromScroll，因偏移量偏差误选到下一条
           this.activeTurnId = marker.id;
           // 锁定 800ms（动画 500ms + 150ms 余量），期间屏蔽 scroll 驱动的 active 更新
           this.scrollLockUntil = Date.now() + 800;
           this.applyActiveState();
-          this.smoothScrollTo(marker.element);
+          if (marker.mounted && marker.element) {
+            this.smoothScrollTo(marker.element);
+          } else {
+            // 消息因虚拟滚动被卸载，只知道估算位置：先滚到估算位置，
+            // 虚拟化会自动挂载真实元素，随后 mutation → mergeMarkers 会补上精确 element
+            this.scrollToEstimatedPosition(marker);
+          }
         }
       };
       this.ui.bar.addEventListener('click', this.onClick);
@@ -402,53 +410,119 @@
       }
 
       // 限定范围查询：仅在 conversationContainer 内搜索，避免全局 DOM 扫描
+      // 注意：受 Claude 页面虚拟滚动影响，这里查到的只是"当前挂载"的子集，
+      // 不代表整个对话的全部消息。mergeMarkers 负责把它合并进跨挂载周期持久化的全量列表。
       const elements = Array.from(this.conversationContainer.querySelectorAll(USER_MESSAGE_SELECTOR));
-      if (elements.length === 0) {
-        console.log(`[Timeline] recalculateAndRenderMarkers: 容器内无用户消息，清空 markers`);
-        this.markers = [];
-        this.markerMap.clear();
+      this.mergeMarkers(elements);
+
+      console.log(`[Timeline] recalculateAndRenderMarkers: 当前挂载 ${elements.length} 条，累计已知 ${this.markers.length} 个 markers, conversationId=${this.conversationId}`);
+      this.renderDots();
+      this.updateIntersectionObserverTargets();
+      this.updateActiveFromScroll();
+    }
+
+    // 将当前挂载的 DOM 元素合并进跨挂载周期持久化的全量 marker 列表。
+    //
+    // 不依赖"挂载到达顺序"：虚拟滚动的挂载/卸载事件到达顺序不保证和消息的最终物理
+    // 顺序一致（尤其是对话刚打开、Claude 自身还在做初始滚动定位时，可能先挂载中间/
+    // 底部一批，再挂载顶部一批）。若用"只增不减的顺序游标"做匹配，一旦到达顺序和数组
+    // 当前顺序有出入，就会把本该复用的旧 marker 误判为新消息，产生重复/错位的点。
+    //
+    // 做法：按 hash 分组匹配（同一文本指纹的多条重复消息，按各自在 visible / markers
+    // 中出现的相对顺序一一对应，优先复用未挂载的旧 marker），完全不用游标限制查找范围；
+    // 合并结束后，统一按真实测量到的 top 值给整个数组排序——顺序的唯一真相来自像素位置，
+    // 不来自挂载事件的到达顺序。
+    mergeMarkers(visibleElements) {
+      const visible = visibleElements.map(el => {
+        const text = this.normalizeText(el.textContent || '');
+        return { el, text, hash: this.hashText(text) };
+      });
+
+      // 按 hash 分组，组内保持 visible 中的原始相对顺序
+      const visibleByHash = new Map();
+      for (const v of visible) {
+        if (!visibleByHash.has(v.hash)) visibleByHash.set(v.hash, []);
+        visibleByHash.get(v.hash).push(v);
+      }
+      // 已知 markers 也按 hash 分组，组内保持数组中的原始相对顺序
+      const knownByHash = new Map();
+      for (const m of this.markers) {
+        if (!knownByHash.has(m.hash)) knownByHash.set(m.hash, []);
+        knownByHash.get(m.hash).push(m);
+      }
+
+      const touchedIds = new Set();
+      const newMarkers = [];
+
+      for (const [hash, vGroup] of visibleByHash) {
+        const known = knownByHash.get(hash) || [];
+        // 同 hash 内优先复用未挂载的旧 marker（保持它在数组中的原始相对顺序），
+        // 用完了才新建——这样同一物理消息在反复挂载/卸载后始终映射回同一个 id。
+        const reusable = known.filter(m => !touchedIds.has(m.id));
+        for (let i = 0; i < vGroup.length; i++) {
+          const v = vGroup[i];
+          const marker = reusable[i];
+          if (marker) {
+            marker.element = v.el;
+            marker.summary = v.text;
+            marker.top = this.getElementTop(v.el);
+            marker.mounted = true;
+            touchedIds.add(marker.id);
+            v.el.dataset.claudeTimelineId = marker.id;
+          } else {
+            const id = this.allocateMarkerId(hash);
+            const created = {
+              id,
+              hash,
+              element: v.el,
+              summary: v.text,
+              n: 0, // 稍后统一重算
+              top: this.getElementTop(v.el),
+              mounted: true,
+              dotElement: null,
+              starred: this.starred.has(id)
+            };
+            this.markers.push(created);
+            this.markerMap.set(id, created);
+            touchedIds.add(id);
+            v.el.dataset.claudeTimelineId = id;
+            newMarkers.push(created);
+          }
+        }
+      }
+
+      // 本轮未被访问到的旧 marker：标记为未挂载，但保留在数组中作为位置估算
+      for (const marker of this.markers) {
+        if (!touchedIds.has(marker.id)) {
+          marker.mounted = false;
+          marker.element = null;
+        }
+      }
+
+      // 顺序的唯一真相是真实像素位置：按 top 统一排序，消除挂载到达顺序带来的错位
+      this.markers.sort((a, b) => a.top - b.top);
+
+      // 基于全量 markers（含未挂载，使用其最后已知 top）重新归一化 n
+      if (this.markers.length === 0) {
         this.densityBuckets = [];
-        this.renderDots();
-        this.updateIntersectionObserverTargets();
         this.activeTurnId = null;
         return;
       }
-
-      const positions = elements.map(el => this.getElementTop(el));
-      const firstOffset = positions[0];
-      const lastOffset = positions[positions.length - 1];
+      const firstOffset = this.markers[0].top;
+      const lastOffset = this.markers[this.markers.length - 1].top;
       let span = lastOffset - firstOffset;
       if (span <= 0) span = 1;
+      for (const marker of this.markers) {
+        marker.n = Math.max(0, Math.min(1, (marker.top - firstOffset) / span));
+      }
+    }
 
-      const textCounts = new Map();
-      this.markerMap.clear();
-      this.markers = elements.map((el, idx) => {
-        const text = this.normalizeText(el.textContent || '');
-        const hash = this.hashText(text);
-        const count = (textCounts.get(hash) || 0) + 1;
-        textCounts.set(hash, count);
-        const id = `u-${hash}-${count}`;
-        el.dataset.claudeTimelineId = id;
-        const top = positions[idx];
-        const n = Math.max(0, Math.min(1, (top - firstOffset) / span));
-        const marker = {
-          id,
-          element: el,
-          summary: text,
-          n,
-          top,
-          dotElement: null,
-          starred: this.starred.has(id)
-        };
-        this.markerMap.set(id, marker);
-        return marker;
-      });
-
-      console.log(`[Timeline] recalculateAndRenderMarkers: 生成 ${this.markers.length} 个 markers, conversationId=${this.conversationId}`);
-      this.renderDots();
-      this.updateIntersectionObserverTargets();
-      this.activeTurnId = null;
-      this.updateActiveFromScroll();
+    // 为一个新出现的文本指纹分配稳定 id：同一 hash 多次出现（重复文本消息）时按出现顺序编号，
+    // 编号只在"新增 marker"时递增，不因挂载/卸载状态变化而重新计数，保证 id 长期稳定。
+    allocateMarkerId(hash) {
+      const count = (this.hashToIds.get(hash) || 0) + 1;
+      this.hashToIds.set(hash, count);
+      return `u-${hash}-${count}`;
     }
 
     renderDots() {
@@ -758,7 +832,10 @@
       // 【Phase 1 · 主策略】顶部仍在「header 以下 ~ 中线以上」可见区间的第一条消息
       //   取 FIRST：多条短消息同时满足时，最顶部的那条才是用户正在读的
       //   触发：消息 top ∈ [headerBottom, midpoint)
+      // 注：受虚拟滚动影响，this.markers 含未挂载（element 为 null）的历史消息，
+      // 这些消息不可能是当前 viewport 内的 active，三阶段查找均跳过。
       for (const m of this.markers) {
+        if (!m.mounted || !m.element) continue;
         const rect = m.element.getBoundingClientRect();
         if (rect.top >= headerBottom && rect.top < midpoint) {
           active = m;
@@ -771,6 +848,7 @@
       //   取 LAST：遍历所有满足条件的，越靠下的越新（下翻时切到 B 当 B.top < midpoint）
       if (!active) {
         for (const m of this.markers) {
+          if (!m.mounted || !m.element) continue;
           const rect = m.element.getBoundingClientRect();
           if (rect.top < midpoint && rect.bottom > headerBottom) {
             active = m; // 不 break，取最靠下那条
@@ -782,11 +860,12 @@
       //   找最后一条顶部已完全滚过 header 的消息，代表上下文中「刚刚读完」的那轮对话
       if (!active) {
         for (const m of this.markers) {
+          if (!m.mounted || !m.element) continue;
           if (m.element.getBoundingClientRect().top < headerBottom) active = m;
         }
       }
 
-      if (!active) active = this.markers[0]; // 兜底
+      if (!active) active = this.markers.find(m => m.mounted && m.element) || this.markers[0]; // 兜底
 
       if (active && active.id !== this.activeTurnId) {
         const oldActiveTurnId = this.activeTurnId;
@@ -827,7 +906,7 @@
       this.intersectionObserver.disconnect();
       this.visibleUserTurns.clear();
       for (const marker of this.markers) {
-        if (marker.element) this.intersectionObserver.observe(marker.element);
+        if (marker.mounted && marker.element) this.intersectionObserver.observe(marker.element);
       }
     }
 
@@ -839,6 +918,37 @@
       const header = document.querySelector('header[data-testid="page-header"]');
       const headerOffset = header ? Math.round(header.getBoundingClientRect().height) + 2 : 0;
       const targetPosition = targetRect.top - containerRect.top + currentScrollTop - headerOffset;
+      const startPosition = currentScrollTop;
+      const distance = targetPosition - startPosition;
+      let startTime = null;
+
+      const step = (currentTime) => {
+        if (startTime === null) startTime = currentTime;
+        const timeElapsed = currentTime - startTime;
+        const run = this.easeInOutQuad(timeElapsed, startPosition, distance, duration);
+        if (isWindowScroll) {
+          window.scrollTo(0, run);
+        } else {
+          this.scrollContainer.scrollTop = run;
+        }
+        if (timeElapsed < duration) requestAnimationFrame(step);
+        else {
+          if (isWindowScroll) window.scrollTo(0, targetPosition);
+          else this.scrollContainer.scrollTop = targetPosition;
+        }
+      };
+      requestAnimationFrame(step);
+    }
+
+    // 目标消息因虚拟滚动被卸载，没有真实 element 可测量，只能用最后一次已知的
+    // 绝对位置（marker.top，与 getElementTop 同一坐标系）估算滚动目标。
+    // 滚动过去后虚拟化会重新挂载该消息，下一次 mutation 回调会用精确位置修正。
+    scrollToEstimatedPosition(marker, duration = 500) {
+      const isWindowScroll = this.scrollContainer === document.body || this.scrollContainer === document.documentElement || this.scrollContainer === document.scrollingElement;
+      const currentScrollTop = isWindowScroll ? window.scrollY : this.scrollContainer.scrollTop;
+      const header = document.querySelector('header[data-testid="page-header"]');
+      const headerOffset = header ? Math.round(header.getBoundingClientRect().height) + 2 : 0;
+      const targetPosition = Math.max(0, marker.top - headerOffset);
       const startPosition = currentScrollTop;
       const distance = targetPosition - startPosition;
       let startTime = null;
@@ -1196,6 +1306,8 @@
     console.log(`[Timeline] initializeTimeline: 创建新实例, url=${location.href}`);
     timelineInstance = new TimelineManager();
     timelineInstance.init();
+    // 调试用：暴露实例供诊断脚本（scripts/debug-monitor.js）读取内部状态
+    window.__claudeTimelineDebug = timelineInstance;
   };
 
   // 切换对话时，记录旧对话第一条消息的 element 引用
@@ -1287,6 +1399,7 @@
       console.log(`[Timeline] handleUrlChange: 销毁旧实例`);
       try { timelineInstance.destroy(); } catch { }
       timelineInstance = null;
+      if (window.__claudeTimelineDebug) window.__claudeTimelineDebug = null;
     }
     if (isConversationRoute() && timelineActive && providerEnabled) {
       // 记录当前第一条消息的引用，用于检测 React 何时完成路由替换
@@ -1344,7 +1457,7 @@
         } catch { providerEnabled = true; }
         if (!timelineActive || !providerEnabled) {
           clearEnsureTimelineTimer();
-          if (timelineInstance) { try { timelineInstance.destroy(); } catch { } timelineInstance = null; }
+          if (timelineInstance) { try { timelineInstance.destroy(); } catch { } timelineInstance = null; window.__claudeTimelineDebug = null; }
         } else {
           boot();
         }
@@ -1366,7 +1479,7 @@
         const enabled = timelineActive && providerEnabled;
         if (!enabled) {
           clearEnsureTimelineTimer();
-          if (timelineInstance) { try { timelineInstance.destroy(); } catch { } timelineInstance = null; }
+          if (timelineInstance) { try { timelineInstance.destroy(); } catch { } timelineInstance = null; window.__claudeTimelineDebug = null; }
         } else if (isConversationRoute()) {
           boot();
           ensureTimeline();
