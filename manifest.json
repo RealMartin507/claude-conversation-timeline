@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Claude Conversation Timeline",
-    "version": "1.4.3",
+    "version": "1.5.1",
     "description": "为 Claude.ai 对话页面添加时间轴导航功能，支持一键跳转、标记重点、自动主题适配。",
     "action": {
         "default_popup": "popup.html",
@@ -16,6 +16,20 @@
                 "https://claude.ai/*"
             ],
             "js": [
+                "src/locator/reactFiberBridge.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN"
+        },
+        {
+            "matches": [
+                "https://claude.ai/*"
+            ],
+            "js": [
+                "src/api/claudeConversation.js",
+                "src/parser/messageTree.js",
+                "src/timeline/timelineData.js",
+                "src/locator/messageLocator.js",
                 "content.js"
             ],
             "css": [

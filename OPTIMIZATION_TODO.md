@@ -2,8 +2,8 @@
 
 > **读者**：新 AI agent  
 > **前置**：先读 `DEV_FIX_LOG.md` 了解架构基线  
-> **范围**：`content.js`、`styles.css`  
-> **当前版本**：1.4.0
+> **范围**：`content.js`、`src/`、`styles.css`
+> **当前版本**：1.5.1
 
 ---
 
@@ -27,6 +27,19 @@
 - 状态：`focusStart`、`focusEnd`、`fisheyeMode`、`scrubFocusIndex`
 - 事件：`onTimelineWheel`（已在 destroy 中移除）
 
+**v1.5.0**：API 数据层
+- Claude API `chat_messages` 作为完整消息数据源
+- current leaf 父链构建当前分支
+- UUID marker 与 React Fiber DOM 映射
+
+**v1.5.1**：虚拟列表回归修复
+- 自动触发 `Load earlier messages`
+- 未挂载 UUID 分段滚动、等待挂载并再次精确匹配
+- Fiber 限定为组件直接 `message.uuid`，禁止递归共享状态
+- `branchOrder` + 真实 DOM 锚点生成空间布局
+- `positionLayout` 锁定坐标，首尾固定为 0%/100%，滚动漂移为 0px
+- 增加 API、marker、DOM 映射和点击诊断输出
+
 ---
 
 ## 📋 待开发任务
@@ -46,4 +59,6 @@
 1. 时间轴内部虚拟滚动窗口（有自己滚动条）
 2. 复杂展开面板/多级状态机
 3. 替换 hash 算法
-4. 跨文件大重构
+4. 与 API 数据层无关的跨文件大重构
+5. 用文本或 `data-testid` 代替 UUID 识别消息
+6. 在滚动时重新计算并移动已渲染 dot

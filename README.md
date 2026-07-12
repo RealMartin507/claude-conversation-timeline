@@ -14,6 +14,8 @@
     - **浅色模式**：清新的磨砂玻璃风格。
     - **深色模式**：极简的"悬浮星点"设计，背景隐形，仅保留节点，极致沉浸，不干扰阅读。
 - **🖱 智能交互**：支持点击、长按、悬停等多种交互方式，操作流畅自然。
+- **🧭 长对话兼容**：时间轴节点来自 Claude API；历史消息尚未挂载时，会自动展开 Claude 的完整虚拟列表并按 UUID 精确定位。
+- **📐 稳定空间布局**：首个/末个用户节点固定在轨道上下端，滚动只更新 active 状态，不会让节点漂移或重新挤在一起。
 
 ## 🧩 如何安装 (Chrome / Edge)
 
@@ -36,6 +38,10 @@
 - **长按节点**：标记/取消标记为"星标"。
 - **悬停节点**：查看消息摘要。
 
+长对话第一次点击较早的节点时，扩展可能需要短暂加载更早消息。这是 Claude
+虚拟列表的正常行为；加载完成后会自动跳转，无需手工点击页面中的
+`Load earlier messages`。
+
 ## 🎯 高级功能
 
 ### 鱼眼模式
@@ -49,12 +55,16 @@
 - 星标状态按对话 ID 保存，刷新页面后依然保留
 - 星标节点显示为醒目的金色
 
-## � 项目结构
+## 📁 项目结构
 
 ```
 .
 ├── manifest.json          # 扩展配置
-├── content.js             # 主要时间轴逻辑
+├── content.js             # Timeline UI、交互与路由编排
+├── src/api/               # Claude 会话 API 获取
+├── src/parser/            # 消息树与当前分支解析
+├── src/timeline/          # API 消息到 Timeline marker 的转换
+├── src/locator/           # UUID → React Fiber DOM 定位
 ├── styles.css             # UI 样式
 ├── popup.html             # 弹窗界面
 ├── popup.js               # 弹窗逻辑
@@ -62,6 +72,13 @@
 └── .kiro/                 # AI 助手配置
     └── steering/          # 项目指导文档
 ```
+
+### 开发文档
+
+- [`DEV_FIX_LOG.md`](DEV_FIX_LOG.md)：当前架构基线、不可破坏约束和现场回归结果。
+- [`CLAUDE_TIMELINE_REFACTOR.md`](CLAUDE_TIMELINE_REFACTOR.md)：API 数据层与 UUID 定位重构说明。
+- [`CLAUDE_TIMELINE_REGRESSION_DEBUG.md`](CLAUDE_TIMELINE_REGRESSION_DEBUG.md)：回归诊断要求、根因和修复记录。
+- [`OPTIMIZATION_TODO.md`](OPTIMIZATION_TODO.md)：已完成能力和后续任务入口。
 
 ## 🔧 开发
 
@@ -72,7 +89,23 @@
 4. 点击"加载已解压的扩展程序"，选择项目目录
 5. 在 Claude.ai 页面测试功能
 
+修改扩展源码后，需要先在 `chrome://extensions/` 点击扩展卡片上的“重新加载”，
+再刷新 Claude 页面。仅刷新 Claude 页面不一定会载入修改后的扩展脚本。
+
+### 调试输出
+
+当前回归诊断开关位于 `content.js` 顶部：
+
+```javascript
+const DEBUG_MODE = true;
+```
+
+开启时，Console 会输出 API/parser 数量、UUID→DOM 映射、marker 位置以及点击跳转结果。
+正常使用不需要阅读这些日志；如需减少输出，可将其改为 `false` 后重新加载扩展。
+
 ### 版本历史
+- **v1.5.1** - 适配 Claude 分批加载和虚拟消息列表：自动加载更早消息、精确 UUID 跳转、稳定 dot 布局、首尾节点锁定，并补全回归诊断。
+- **v1.5.0** - Timeline 改为 Claude API 完整会话数据驱动；使用消息 UUID 定位当前 DOM，兼容虚拟滚动。
 - **v1.4.3** - 修复切换对话时时间轴 dot 混乱问题（SPA 路由替换竞态）；添加详细 debug 日志。
 - **v1.4.2** - 修复了由于 2K 大屏布局下产生的伪侧边栏导致高亮和跳转失灵的 bug。
 - **v1.4.1** - 优化鱼眼模式体验：修复聚合点吸附边界及焦点区点位分布空白问题

@@ -4,6 +4,9 @@
   const TIMELINE_DOT_CLASS = 'claude-timeline-dot';
   const TIMELINE_TOOLTIP_ID = 'claude-timeline-tooltip';
   const DENSITY_BUCKET_SIZE_PX = 2;
+  // Regression-debug switch. Keep all diagnostic output behind this single
+  // flag so it can be disabled without touching timeline behavior.
+  const DEBUG_MODE = true;
 
   class TimelineManager {
     constructor() {
@@ -14,6 +17,22 @@
       this.activeTurnId = null;
       this.starred = new Set();
       this.markerMap = new Map();
+      // API is the authoritative source for complete conversation data. DOM only
+      // supplies a transient uuid -> element map for navigation and active state.
+      this.conversationCache = {
+        conversationId: this.conversationId,
+        messages: [],
+        markers: this.markers,
+        domMap: new Map()
+      };
+      this.apiMode = false;
+      this.organizationId = null;
+      this.apiRequestController = null;
+      this.apiRequestVersion = 0;
+      this.apiRefreshTimer = null;
+      this.navigationVersion = 0;
+      this.positionLayoutKey = '';
+      this.positionLayout = new Map();
       // hash(文本指纹) -> 已分配的 id 队列，跨越挂载/卸载持久化，用于合并时稳定复用 id
       this.hashToIds = new Map();
       this.ui = { bar: null, track: null, tooltip: null };
@@ -52,6 +71,7 @@
       this.scrollLockUntil = 0;
 
       this.conversationId = this.extractConversationIdFromPath(location.pathname);
+      this.conversationCache.conversationId = this.conversationId;
       this.visibleRange = { start: 0, end: -1 };
       this.yPositions = [];
       this.bucketSizePx = DENSITY_BUCKET_SIZE_PX;
@@ -77,8 +97,13 @@
       this.setupEventListeners();
       this.setupObservers();
       this.conversationId = this.extractConversationIdFromPath(location.pathname);
+      this.conversationCache.conversationId = this.conversationId;
       this.loadStars();
-      this.recalculateAndRenderMarkers();
+      const loadedFromApi = await this.refreshConversationData({ initial: true });
+      if (!loadedFromApi) {
+        this.recalculateAndRenderMarkers();
+        this.scheduleConversationRefresh(1500);
+      }
       console.log(`[Timeline] init() 完成，总耗时=${Date.now() - t0}ms, markers=${this.markers.length}`);
     }
 
@@ -157,7 +182,13 @@
           if (hasNewUserMessage) break;
         }
 
-        if (hasNewUserMessage) {
+        if (this.apiMode) {
+          // DOM mutations no longer define the timeline. They only refresh the
+          // UUID map and coalesce a backend refresh for genuinely new messages.
+          this.refreshDomMappings();
+          if (hasNewUserMessage) this.scheduleConversationRefresh(350);
+          else this.debouncedRecalculate();
+        } else if (hasNewUserMessage) {
           // 新用户消息：立即更新时间轴（无防抖延迟）
           requestAnimationFrame(() => this.recalculateAndRenderMarkers());
         } else {
@@ -285,7 +316,9 @@
           // 锁定 800ms（动画 500ms + 150ms 余量），期间屏蔽 scroll 驱动的 active 更新
           this.scrollLockUntil = Date.now() + 800;
           this.applyActiveState();
-          if (marker.mounted && marker.element) {
+          if (this.apiMode) {
+            this.scrollToMarker(marker);
+          } else if (marker.mounted && marker.element) {
             this.smoothScrollTo(marker.element);
           } else {
             // 消息因虚拟滚动被卸载，只知道估算位置：先滚到估算位置，
@@ -400,6 +433,346 @@
       this.ui.bar.addEventListener('wheel', this.onTimelineWheel, { passive: false });
     }
 
+    scheduleConversationRefresh(delay = 250) {
+      if (this.apiRefreshTimer) clearTimeout(this.apiRefreshTimer);
+      this.apiRefreshTimer = setTimeout(() => {
+        this.apiRefreshTimer = null;
+        this.refreshConversationData();
+      }, delay);
+    }
+
+    async refreshConversationData({ initial = false } = {}) {
+      const api = globalThis.ClaudeTimeline?.api;
+      const parser = globalThis.ClaudeTimeline?.parser;
+      const timelineData = globalThis.ClaudeTimeline?.timelineData;
+      if (!api || !parser || !timelineData || !this.conversationId) return false;
+
+      if (this.apiRequestController) this.apiRequestController.abort();
+      const controller = new AbortController();
+      this.apiRequestController = controller;
+      const requestVersion = ++this.apiRequestVersion;
+      const conversationId = this.conversationId;
+      try {
+        const result = await api.fetchConversation(conversationId, {
+          signal: controller.signal,
+          organizationId: this.organizationId
+        });
+        if (requestVersion !== this.apiRequestVersion || conversationId !== this.conversationId) return false;
+        this.organizationId = result.organizationId;
+        const conversation = parser.normalizeConversation(result.payload);
+        const branch = parser.buildCurrentBranch(conversation.messages, conversation.currentLeafUuid);
+        const nextMarkers = timelineData.buildTimelineMarkers(branch);
+        this.debugApiState(result.payload, conversation, branch, nextMarkers);
+        this.applyApiMarkers(nextMarkers, conversation.messages);
+        this.apiMode = true;
+        this.refreshDomMappings();
+        this.updateApiMarkerPositions();
+        this.debugDomMapping();
+        this.debugMarkerState('API refresh');
+        this.renderDots();
+        this.updateIntersectionObserverTargets();
+        this.updateActiveFromScroll();
+        console.log(`[Timeline] API 数据已加载: messages=${conversation.messages.length}, branch=${branch.length}, markers=${nextMarkers.length}`);
+        return true;
+      } catch (error) {
+        if (error?.name === 'AbortError') return false;
+        console.warn(`[Timeline] Claude API 数据加载失败，${initial ? '降级到 DOM Timeline' : '保留当前 Timeline'}:`, error);
+        if (initial) this.apiMode = false;
+        if (initial && this.conversationId === conversationId) this.scheduleConversationRefresh(3000);
+        return false;
+      } finally {
+        if (this.apiRequestController === controller) this.apiRequestController = null;
+      }
+    }
+
+    applyApiMarkers(nextMarkers, messages) {
+      const previous = this.markerMap;
+      const nextMap = new Map();
+      for (const marker of nextMarkers) {
+        const old = previous.get(marker.uuid);
+        if (old?.element?.isConnected) {
+          marker.element = old.element;
+          marker.mounted = true;
+        }
+        if (Number.isFinite(old?.top)) marker.top = old.top;
+        if (Number.isFinite(old?.n)) marker.n = old.n;
+        marker.hasMeasuredPosition = !!old?.hasMeasuredPosition;
+        marker.starred = this.starred.has(marker.uuid);
+        nextMap.set(marker.uuid, marker);
+      }
+      this.markers = nextMarkers;
+      this.markerMap = nextMap;
+      this.activeTurnId = this.activeTurnId && nextMap.has(this.activeTurnId) ? this.activeTurnId : null;
+      this.conversationCache = {
+        conversationId: this.conversationId,
+        messages,
+        markers: this.markers,
+        domMap: this.conversationCache?.domMap || new Map()
+      };
+    }
+
+    refreshDomMappings() {
+      if (!this.apiMode || !this.conversationCache?.domMap) return;
+      const locator = globalThis.ClaudeTimeline?.locator;
+      if (!locator) return;
+      const uuids = this.markers.map(marker => marker.uuid);
+      locator.refreshDomMap(this.conversationCache.domMap, uuids);
+      for (const marker of this.markers) {
+        const element = this.conversationCache.domMap.get(marker.uuid);
+        marker.element = element?.isConnected ? element : null;
+        marker.mounted = !!marker.element;
+      }
+      this.debugDomMapping();
+    }
+
+    updateApiMarkerPositions() {
+      // API establishes message membership/order; only measured DOM elements
+      // establish visual space. Ratios use the real scrollable content height,
+      // not the first/last currently mounted message (which changes in a
+      // virtual list as the user scrolls).
+      const isWindowScroll = this.scrollContainer === document.body || this.scrollContainer === document.documentElement || this.scrollContainer === document.scrollingElement;
+      const contentHeight = isWindowScroll
+        ? Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0, window.innerHeight)
+        : Math.max(this.scrollContainer.scrollHeight, this.scrollContainer.clientHeight, 1);
+      const measured = new Set();
+      for (const marker of this.markers) {
+        if (marker.element?.isConnected) {
+          marker.top = this.getElementTop(marker.element);
+          marker.hasMeasuredPosition = true;
+        }
+        if (marker.hasMeasuredPosition && Number.isFinite(marker.top)) {
+          marker.n = Math.max(0, Math.min(1, marker.top / contentHeight));
+          measured.add(marker.uuid);
+        }
+      }
+
+      // Claude exposes each mounted virtual row's absolute top and row ordinal.
+      // For unmounted rows, interpolate only between real physical anchors plus
+      // the virtual list's top/bottom boundaries. This avoids marker-index /
+      // marker-count spacing while preventing all unknown dots from collapsing.
+      const branchLength = this.markers[0]?.branchLength || 0;
+      const anchors = [{ order: 0, top: 0 }];
+      for (const marker of this.markers) {
+        if (measured.has(marker.uuid) && Number.isFinite(marker.branchOrder)) {
+          anchors.push({ order: marker.branchOrder, top: marker.top });
+        }
+      }
+      anchors.push({ order: Math.max(1, branchLength - 1), top: contentHeight });
+      anchors.sort((a, b) => a.order - b.order || a.top - b.top);
+
+      for (const marker of this.markers) {
+        if (measured.has(marker.uuid)) continue;
+        const order = marker.branchOrder;
+        let left = anchors[0];
+        let right = anchors[anchors.length - 1];
+        for (let i = 1; i < anchors.length; i++) {
+          if (anchors[i].order >= order) {
+            right = anchors[i];
+            left = anchors[i - 1];
+            break;
+          }
+        }
+        const orderSpan = Math.max(1, right.order - left.order);
+        const ratio = Math.max(0, Math.min(1, (order - left.order) / orderSpan));
+        marker.top = left.top + (right.top - left.top) * ratio;
+        marker.n = Math.max(0, Math.min(1, marker.top / contentHeight));
+      }
+
+      const layoutKey = this.markers.map(marker => marker.uuid).join('|');
+      if (layoutKey !== this.positionLayoutKey || this.positionLayout.size !== this.markers.length) {
+        // The timeline represents the span from the first user turn to the last
+        // user turn, so those endpoints must occupy the track endpoints even
+        // when the final assistant response extends below the last user turn.
+        const firstN = this.markers[0]?.n;
+        const lastN = this.markers[this.markers.length - 1]?.n;
+        const markerSpan = Number.isFinite(firstN) && Number.isFinite(lastN)
+          ? Math.max(0.000001, lastN - firstN)
+          : 1;
+        this.positionLayout = new Map(this.markers.map((marker, index) => {
+          const fallback = this.markers.length > 1 ? index / (this.markers.length - 1) : 0;
+          const normalized = Number.isFinite(marker.n)
+            ? Math.max(0, Math.min(1, (marker.n - firstN) / markerSpan))
+            : fallback;
+          marker.n = normalized;
+          return [marker.uuid, normalized];
+        }));
+        this.positionLayoutKey = layoutKey;
+      } else {
+        // Virtual rows mount and unmount while scrolling. Their fresh physical
+        // measurements improve navigation, but must never move timeline dots.
+        for (const marker of this.markers) {
+          const locked = this.positionLayout.get(marker.uuid);
+          if (Number.isFinite(locked)) marker.n = locked;
+        }
+      }
+      this.debugMarkerState('position calculation');
+    }
+
+    async scrollToMarker(marker) {
+      const locator = globalThis.ClaudeTimeline?.locator;
+      const navigationVersion = ++this.navigationVersion;
+      if (DEBUG_MODE) {
+        console.groupCollapsed(`[Timeline Debug] clicked marker: ${marker.uuid}`);
+        console.log({ uuid: marker.uuid, sender: marker.sender || 'human', text: marker.summary, mounted: marker.mounted });
+        console.log('findMessageElement: search start');
+      }
+      let element = locator?.findMessageElement(marker.uuid, this.conversationCache.domMap);
+      if (DEBUG_MODE) {
+        console.log('fiber scanned:', locator?.getLastScanStats?.() || 'unavailable');
+        console.log('result:', element ? 'FOUND' : 'FAILED');
+      }
+      if (!element) {
+        if (DEBUG_MODE) {
+          console.log('uuid not currently mounted; starting virtual-scroll search');
+        }
+        this.scrollLockUntil = Date.now() + 15000;
+        element = await this.findVirtualizedMessage(marker, navigationVersion);
+        if (!element || navigationVersion !== this.navigationVersion) {
+          console.warn(`[Timeline] FAILED: uuid ${marker.uuid} was not mounted after virtual-scroll search`);
+          if (DEBUG_MODE) {
+            console.log('scroll: failed');
+            console.groupEnd();
+          }
+          return;
+        }
+      }
+      marker.element = element;
+      marker.mounted = true;
+      marker.top = this.getElementTop(element);
+      this.smoothScrollTo(element);
+      this.scrollLockUntil = Date.now() + 800;
+      if (DEBUG_MODE) {
+        console.log('scroll: success');
+        console.groupEnd();
+      }
+    }
+
+    async findVirtualizedMessage(marker, navigationVersion) {
+      const locator = globalThis.ClaudeTimeline?.locator;
+      if (!locator || !this.scrollContainer) return null;
+
+      // Claude initially exposes only the newest message window. The complete
+      // virtual list is created only after its hidden accessibility control is
+      // activated. This is not message identification: UUID remains the sole
+      // identity used after the list has been expanded.
+      const earlierButton = Array.from(document.querySelectorAll('button')).find(button =>
+        button.textContent?.trim() === 'Load earlier messages'
+      );
+      if (earlierButton && !earlierButton.disabled) {
+        earlierButton.click();
+        await this.waitForVirtualDomUpdate(500);
+        this.refreshDomMappings();
+        const immediatelyFound = locator.findMessageElement(marker.uuid, this.conversationCache.domMap);
+        if (immediatelyFound) return immediatelyFound;
+      }
+
+      const isWindowScroll = this.scrollContainer === document.body ||
+        this.scrollContainer === document.documentElement ||
+        this.scrollContainer === document.scrollingElement;
+      const readTop = () => isWindowScroll ? window.scrollY : this.scrollContainer.scrollTop;
+      const readMax = () => isWindowScroll
+        ? Math.max(0, document.documentElement.scrollHeight - window.innerHeight)
+        : Math.max(0, this.scrollContainer.scrollHeight - this.scrollContainer.clientHeight);
+      const writeTop = value => {
+        if (isWindowScroll) window.scrollTo(0, value);
+        else this.scrollContainer.scrollTop = value;
+      };
+      const viewport = Math.max(200, isWindowScroll ? window.innerHeight : this.scrollContainer.clientHeight);
+      const currentTop = readTop();
+      let nearestMounted = null;
+      let nearestDistance = Infinity;
+      for (const candidate of this.markers) {
+        if (!candidate.mounted || !Number.isFinite(candidate.top)) continue;
+        const distance = Math.abs(candidate.top - currentTop);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestMounted = candidate;
+        }
+      }
+      const preferredDirection = nearestMounted && marker.order < nearestMounted.order ? -1 : 1;
+
+      const scanDirection = async direction => {
+        for (let step = 0; step < 80 && navigationVersion === this.navigationVersion; step++) {
+          const before = readTop();
+          const next = Math.max(0, Math.min(readMax(), before + direction * viewport * 0.75));
+          if (next === before) return null;
+          writeTop(next);
+          await this.waitForVirtualDomUpdate();
+          this.refreshDomMappings();
+          const found = locator.findMessageElement(marker.uuid, this.conversationCache.domMap);
+          if (found) return found;
+        }
+        return null;
+      };
+
+      return await scanDirection(preferredDirection) || await scanDirection(-preferredDirection);
+    }
+
+    waitForVirtualDomUpdate(timeout = 120) {
+      return new Promise(resolve => {
+        let finished = false;
+        const done = () => {
+          if (finished) return;
+          finished = true;
+          observer.disconnect();
+          resolve();
+        };
+        const observer = new MutationObserver(() => requestAnimationFrame(done));
+        observer.observe(this.conversationContainer || document.body, { childList: true, subtree: true });
+        setTimeout(done, timeout);
+      });
+    }
+
+    debugApiState(payload, conversation, branch, markers) {
+      if (!DEBUG_MODE) return;
+      const raw = Array.isArray(payload?.chat_messages) ? payload.chat_messages : [];
+      const count = (items, sender) => items.filter(item => item.sender === sender).length;
+      console.groupCollapsed('[Timeline Debug] API messages');
+      console.log({
+        total: raw.length,
+        human: count(raw, 'human'),
+        assistant: count(raw, 'assistant'),
+        parserConverted: conversation.messages.length,
+        parserDropped: raw.length - conversation.messages.length,
+        currentBranch: branch.length,
+        timelineMarkers: markers.length
+      });
+      console.table(conversation.messages.map(message => ({
+        uuid: message.uuid,
+        sender: message.sender,
+        parentUuid: message.parentUuid,
+        text: message.text
+      })));
+      console.groupEnd();
+    }
+
+    debugDomMapping() {
+      if (!DEBUG_MODE || !this.apiMode) return;
+      const mounted = this.markers.filter(marker => marker.element?.isConnected).length;
+      console.log('[Timeline Debug] DOM mapping', {
+        apiUuidCount: this.markers.length,
+        foundInDom: mounted,
+        missingFromDom: this.markers.length - mounted,
+        fiber: globalThis.ClaudeTimeline?.locator?.getLastScanStats?.() || null
+      });
+    }
+
+    debugMarkerState(reason) {
+      if (!DEBUG_MODE || !this.apiMode) return;
+      console.groupCollapsed(`[Timeline Debug] markers: ${reason}`);
+      console.table(this.markers.map((marker, index) => ({
+        index,
+        uuid: marker.uuid,
+        sender: marker.sender || 'human',
+        text: marker.summary,
+        elementExists: !!marker.element,
+        mounted: marker.mounted,
+        position: marker.n,
+        documentTop: marker.top
+      })));
+      console.groupEnd();
+    }
+
     recalculateAndRenderMarkers() {
       if (!this.ui.track || !this.conversationContainer) return;
 
@@ -407,6 +780,15 @@
       if (!document.body.contains(this.conversationContainer)) {
         console.warn(`[Timeline] recalculateAndRenderMarkers: conversationContainer 已脱离 DOM，触发 ensureContainersUpToDate`);
         this.ensureContainersUpToDate();
+      }
+
+      if (this.apiMode) {
+        this.refreshDomMappings();
+        this.updateApiMarkerPositions();
+        this.renderDots();
+        this.updateIntersectionObserverTargets();
+        this.updateActiveFromScroll();
+        return;
       }
 
       // 限定范围查询：仅在 conversationContainer 内搜索，避免全局 DOM 扫描
@@ -527,7 +909,14 @@
 
     renderDots() {
       this.ui.track.querySelectorAll(`.${TIMELINE_DOT_CLASS}`).forEach(n => n.remove());
-      if (this.markers.length === 0) return;
+      for (const marker of this.markers) marker.dotElement = null;
+      // API mode renders a fixed complete marker set. Unknown virtual rows are
+      // grouped at a measured anchor by updateApiMarkerPositions(), never
+      // introduced one-by-one as the user scrolls up.
+      const renderMarkers = this.apiMode
+        ? this.markers.slice().sort((a, b) => a.n - b.n || a.order - b.order)
+        : this.markers;
+      if (renderMarkers.length === 0) return;
       const barHeight = this.ui.bar.clientHeight || 1;
       const pad = 14;
       const minGap = 14;
@@ -537,11 +926,11 @@
       const maxFitDots = Math.max(1, Math.floor(usable / minGap) + 1);
 
       // 简单模式：全部独立 dot
-      if (this.markers.length <= maxFitDots) {
+      if (renderMarkers.length <= maxFitDots) {
         this.fisheyeMode = false;
         this.focusStart = -1;
         this.focusEnd = -1;
-        const desired = this.markers.map(m => pad + m.n * usable);
+        const desired = renderMarkers.map(m => pad + m.n * usable);
         const spacedYs = this.applyMinGap(desired, pad, pad + usable, minGap);
         this.yPositions = spacedYs;
 
@@ -550,8 +939,8 @@
         }
 
         const frag = document.createDocumentFragment();
-        for (let i = 0; i < this.markers.length; i++) {
-          const marker = this.markers[i];
+        for (let i = 0; i < renderMarkers.length; i++) {
+          const marker = renderMarkers[i];
           const dot = document.createElement('button');
           dot.type = 'button';
           dot.className = TIMELINE_DOT_CLASS;
@@ -577,10 +966,10 @@
 
       // 确定焦点索引（优先使用 scrubFocusIndex，否则使用 activeIndex）
       let activeIndex = 0;
-      if (this.scrubFocusIndex >= 0 && this.scrubFocusIndex < this.markers.length) {
+      if (this.scrubFocusIndex >= 0 && this.scrubFocusIndex < renderMarkers.length) {
         activeIndex = this.scrubFocusIndex;
       } else if (this.activeTurnId) {
-        const idx = this.markers.findIndex(m => m.id === this.activeTurnId);
+        const idx = renderMarkers.findIndex(m => m.id === this.activeTurnId);
         if (idx >= 0) activeIndex = idx;
       }
 
@@ -588,13 +977,13 @@
       const focusSlots = Math.max(1, maxFitDots - 2); // 预留上下各 1 个聚合 dot
       const focusHalf = Math.floor((focusSlots - 1) / 2);
       let focusStart = Math.max(0, activeIndex - focusHalf);
-      let focusEnd = Math.min(this.markers.length - 1, activeIndex + focusHalf);
+      let focusEnd = Math.min(renderMarkers.length - 1, activeIndex + focusHalf);
 
       // 靠近边缘时偏移窗口，充分利用 focusSlots
       if (focusEnd - focusStart + 1 < focusSlots) {
         if (focusStart === 0) {
-          focusEnd = Math.min(this.markers.length - 1, focusStart + focusSlots - 1);
-        } else if (focusEnd === this.markers.length - 1) {
+          focusEnd = Math.min(renderMarkers.length - 1, focusStart + focusSlots - 1);
+        } else if (focusEnd === renderMarkers.length - 1) {
           focusStart = Math.max(0, focusEnd - focusSlots + 1);
         }
       }
@@ -609,29 +998,29 @@
         const markerIds = [];
         let sumN = 0;
         for (let i = 0; i < focusStart; i++) {
-          markerIds.push(this.markers[i].id);
-          sumN += this.markers[i].n;
+          markerIds.push(renderMarkers[i].id);
+          sumN += renderMarkers[i].n;
         }
         // 固定吸附到时间轴顶端，代表整段对话的起点
         renderItems.push({ type: 'aggregate', markerIds, naturalN: 0 });
       }
 
       // 焦点区独立 dot：将本窗口内的 n 线性拉伸映射到 [0,1]，充满两端聚合 dot 之间的空间
-      const focusStartN = this.markers[focusStart].n;
-      const focusEndN = this.markers[focusEnd].n;
+      const focusStartN = renderMarkers[focusStart].n;
+      const focusEndN = renderMarkers[focusEnd].n;
       const focusRange = Math.max(0.0001, focusEndN - focusStartN);
       for (let i = focusStart; i <= focusEnd; i++) {
-        const remappedN = (this.markers[i].n - focusStartN) / focusRange;
-        renderItems.push({ type: 'individual', marker: this.markers[i], naturalN: remappedN });
+        const remappedN = (renderMarkers[i].n - focusStartN) / focusRange;
+        renderItems.push({ type: 'individual', marker: renderMarkers[i], naturalN: remappedN });
       }
 
-      if (focusEnd < this.markers.length - 1) {
+      if (focusEnd < renderMarkers.length - 1) {
         // 下方聚合 dot
         const markerIds = [];
         let sumN = 0;
-        for (let i = focusEnd + 1; i < this.markers.length; i++) {
-          markerIds.push(this.markers[i].id);
-          sumN += this.markers[i].n;
+        for (let i = focusEnd + 1; i < renderMarkers.length; i++) {
+          markerIds.push(renderMarkers[i].id);
+          sumN += renderMarkers[i].n;
         }
         // 固定吸附到时间轴底端，代表整段对话的终点
         renderItems.push({ type: 'aggregate', markerIds, naturalN: 1 });
@@ -749,6 +1138,14 @@
       if (!dot) return null;
       const targetTurnId = dot.dataset.targetTurnId;
       if (targetTurnId) return this.markerMap.get(targetTurnId) || null;
+
+      // 聚合 dot：API mode has no meaningful document-coordinate estimate for
+      // unmounted elements, so prefer the active item in the group.
+      if (this.apiMode) {
+        const active = this.activeTurnId && this.markerMap.get(this.activeTurnId);
+        if (active?.dotElement === dot) return active;
+        return this.markers.find(marker => marker.dotElement === dot) || null;
+      }
 
       // 聚合 dot：找到与当前阅读位置最接近的 marker
       const readingOffset = this.getCurrentReadingOffset();
@@ -1201,6 +1598,8 @@
 
     extractConversationIdFromPath(pathname = location.pathname) {
       try {
+        const fromApiModule = globalThis.ClaudeTimeline?.api?.extractConversationId?.(pathname);
+        if (fromApiModule) return fromApiModule;
         const segs = String(pathname || '').split('/').filter(Boolean);
         const i = segs.indexOf('chat');
         if (i === -1) return null;
@@ -1253,6 +1652,19 @@
 
     destroy() {
       this.cancelLongPress();
+      if (this.apiRefreshTimer) {
+        clearTimeout(this.apiRefreshTimer);
+        this.apiRefreshTimer = null;
+      }
+      if (this.apiRequestController) {
+        try { this.apiRequestController.abort(); } catch { }
+        this.apiRequestController = null;
+      }
+      this.apiRequestVersion += 1;
+      this.navigationVersion += 1;
+      this.positionLayout.clear();
+      this.positionLayoutKey = '';
+      try { this.conversationCache?.domMap?.clear(); } catch { }
       try { this.mutationObserver?.disconnect(); } catch { }
       try { this.resizeObserver?.disconnect(); } catch { }
       try { this.intersectionObserver?.disconnect(); } catch { }
